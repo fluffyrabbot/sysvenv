@@ -1,0 +1,92 @@
+#!/bin/bash
+#
+# pip wrapper - Routes pip to correct venv and handles snapshotting
+#
+# This wrapper intercepts pip commands and:
+# 1. Routes root user to system venv (/opt/system-python/venv)
+# 2. Routes regular users to user venv (~/.local/python-packages/venv)
+# 3. Takes before/after snapshots for install/uninstall operations
+# 4. Respects $VIRTUAL_ENV if already set (project venvs)
+#
+
+set -e
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+SYSTEM_VENV="/opt/system-python/venv"
+USER_VENV="$HOME/.local/python-packages/venv"
+
+# ============================================================================
+# Determine target venv
+# ============================================================================
+
+# If we're in an activated venv, use that (highest priority)
+if [ -n "$VIRTUAL_ENV" ]; then
+    TARGET_VENV="$VIRTUAL_ENV"
+    USE_WRAPPER=false
+# If running as root, use system venv
+elif [ "$EUID" -eq 0 ]; then
+    TARGET_VENV="$SYSTEM_VENV"
+    USE_WRAPPER=false
+# Regular user - use user venv
+else
+    TARGET_VENV="$USER_VENV"
+    USE_WRAPPER=true
+fi
+
+PIP_BIN="$TARGET_VENV/bin/pip"
+
+# Check if pip exists
+if [ ! -f "$PIP_BIN" ]; then
+    echo "Error: pip not found at $PIP_BIN" >&2
+
+    if [ "$EUID" -ne 0 ] && [ "$TARGET_VENV" = "$USER_VENV" ]; then
+        echo "" >&2
+        echo "User venv not initialized. Run:" >&2
+        echo "  pyctl init" >&2
+    fi
+
+    exit 1
+fi
+
+# ============================================================================
+# Snapshot handling for user venv
+# ============================================================================
+
+# Check if this is a write operation that should be snapshotted
+SNAPSHOT_OPERATIONS="install|uninstall|upgrade"
+FIRST_ARG="${1:-}"
+
+SHOULD_SNAPSHOT=false
+if [ "$USE_WRAPPER" = true ] && [[ "$FIRST_ARG" =~ ^($SNAPSHOT_OPERATIONS)$ ]]; then
+    SHOULD_SNAPSHOT=true
+fi
+
+# Take before snapshot
+if [ "$SHOULD_SNAPSHOT" = true ]; then
+    # Check if pyctl exists
+    if command -v pyctl >/dev/null 2>&1; then
+        pyctl _snapshot-before "$@" 2>/dev/null || true
+    fi
+fi
+
+# ============================================================================
+# Run actual pip
+# ============================================================================
+
+"$PIP_BIN" "$@"
+EXIT_CODE=$?
+
+# ============================================================================
+# Take after snapshot
+# ============================================================================
+
+if [ "$SHOULD_SNAPSHOT" = true ] && [ $EXIT_CODE -eq 0 ]; then
+    if command -v pyctl >/dev/null 2>&1; then
+        pyctl _snapshot-after "$@" 2>/dev/null || true
+    fi
+fi
+
+exit $EXIT_CODE

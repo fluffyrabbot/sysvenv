@@ -1,0 +1,864 @@
+#!/usr/bin/env python3
+"""
+pyctl - Two-Tier Python Package System Manager
+
+Manages user-level Python virtual environment with automatic snapshots,
+history tracking, and easy undo/rollback capabilities.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+import venv
+
+
+# ============================================================================
+# Constants & Paths
+# ============================================================================
+
+HOME = Path.home()
+PYCTL_ROOT = HOME / ".local" / "python-packages"
+VENV_PATH = PYCTL_ROOT / "venv"
+HISTORY_PATH = PYCTL_ROOT / "history"
+SNAPSHOTS_PATH = PYCTL_ROOT / "snapshots"
+CONFIG_PATH = PYCTL_ROOT / "config.toml"
+
+DEFAULT_CONFIG = """[history]
+max_entries = 100
+auto_snapshot = true
+show_diff_after_install = true
+
+[snapshots]
+auto_baseline = true
+
+[ui]
+color = true
+verbose = false
+"""
+
+
+# ============================================================================
+# Colors & Output
+# ============================================================================
+
+class Colors:
+    """ANSI color codes for terminal output"""
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    CYAN = "\033[96m"
+    GRAY = "\033[90m"
+
+
+def color_enabled() -> bool:
+    """Check if color output should be enabled"""
+    return sys.stdout.isatty() and os.getenv("NO_COLOR") is None
+
+
+def cprint(text: str, color: str = "", bold: bool = False):
+    """Print colored text if color is enabled"""
+    if color_enabled():
+        style = Colors.BOLD if bold else ""
+        print(f"{style}{color}{text}{Colors.RESET}")
+    else:
+        print(text)
+
+
+def success(text: str):
+    cprint(f"✓ {text}", Colors.GREEN)
+
+
+def error(text: str):
+    cprint(f"✗ {text}", Colors.RED, bold=True)
+
+
+def warning(text: str):
+    cprint(f"⚠ {text}", Colors.YELLOW)
+
+
+def info(text: str):
+    cprint(f"ℹ {text}", Colors.BLUE)
+
+
+def heading(text: str):
+    cprint(f"\n{text}", Colors.CYAN, bold=True)
+
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+def run_command(cmd: List[str], capture: bool = True, check: bool = True) -> subprocess.CompletedProcess:
+    """Run a shell command"""
+    try:
+        if capture:
+            return subprocess.run(cmd, capture_output=True, text=True, check=check)
+        else:
+            return subprocess.run(cmd, check=check)
+    except subprocess.CalledProcessError as e:
+        error(f"Command failed: {' '.join(cmd)}")
+        if e.stderr:
+            print(e.stderr, file=sys.stderr)
+        raise
+
+
+def pip_freeze() -> str:
+    """Get current pip freeze output"""
+    pip_bin = VENV_PATH / "bin" / "pip"
+    if not pip_bin.exists():
+        return ""
+    result = run_command([str(pip_bin), "freeze"])
+    return result.stdout
+
+
+def get_history_id() -> int:
+    """Get next history entry ID"""
+    if not HISTORY_PATH.exists():
+        return 1
+
+    max_id = 0
+    for file in HISTORY_PATH.glob("*_before.json"):
+        try:
+            id_str = file.stem.split("_")[0]
+            max_id = max(max_id, int(id_str))
+        except (ValueError, IndexError):
+            continue
+
+    return max_id + 1
+
+
+def venv_exists() -> bool:
+    """Check if user venv exists"""
+    return VENV_PATH.exists() and (VENV_PATH / "bin" / "python3").exists()
+
+
+def ensure_dirs():
+    """Ensure all necessary directories exist"""
+    PYCTL_ROOT.mkdir(parents=True, exist_ok=True)
+    HISTORY_PATH.mkdir(exist_ok=True)
+    SNAPSHOTS_PATH.mkdir(exist_ok=True)
+
+
+def parse_freeze_to_dict(freeze_output: str) -> Dict[str, str]:
+    """Parse pip freeze output into {package: version} dict"""
+    packages = {}
+    for line in freeze_output.strip().split('\n'):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if '==' in line:
+            pkg, ver = line.split('==', 1)
+            packages[pkg.strip()] = ver.strip()
+    return packages
+
+
+def diff_packages(before: str, after: str) -> Tuple[List[str], List[str], List[str]]:
+    """Calculate package diff (added, removed, modified)"""
+    before_pkgs = parse_freeze_to_dict(before)
+    after_pkgs = parse_freeze_to_dict(after)
+
+    added = []
+    removed = []
+    modified = []
+
+    for pkg, ver in after_pkgs.items():
+        if pkg not in before_pkgs:
+            added.append(f"{pkg}=={ver}")
+        elif before_pkgs[pkg] != ver:
+            modified.append(f"{pkg}: {before_pkgs[pkg]} → {ver}")
+
+    for pkg, ver in before_pkgs.items():
+        if pkg not in after_pkgs:
+            removed.append(f"{pkg}=={ver}")
+
+    return added, removed, modified
+
+
+# ============================================================================
+# Commands
+# ============================================================================
+
+def cmd_init(args):
+    """Initialize user venv"""
+    heading("Initializing user Python environment")
+
+    if venv_exists():
+        warning("User venv already exists")
+        info(f"Location: {VENV_PATH}")
+        return 0
+
+    ensure_dirs()
+
+    # Create venv
+    info("Creating virtual environment...")
+    venv.create(VENV_PATH, with_pip=True, symlinks=True)
+    success(f"Created venv at {VENV_PATH}")
+
+    # Upgrade pip
+    info("Upgrading pip...")
+    pip_bin = VENV_PATH / "bin" / "pip"
+    run_command([str(pip_bin), "install", "--upgrade", "pip"], capture=False)
+
+    # Create baseline snapshot
+    baseline_file = SNAPSHOTS_PATH / "baseline.txt"
+    freeze = pip_freeze()
+    baseline_file.write_text(freeze)
+    success("Created baseline snapshot")
+
+    # Create default config if it doesn't exist
+    if not CONFIG_PATH.exists():
+        CONFIG_PATH.write_text(DEFAULT_CONFIG)
+        success("Created default config")
+
+    heading("Setup complete!")
+    print("\nNext steps:")
+    print(f"  1. Add to your shell config (~/.bashrc or ~/.zshrc):")
+    cprint(f'     export PATH="{VENV_PATH}/bin:$PATH"', Colors.CYAN)
+    print(f"  2. Reload shell: source ~/.bashrc")
+    print(f"  3. Start installing: pip install <package>")
+
+    return 0
+
+
+def cmd_status(args):
+    """Show current status"""
+    heading("Python Environment Status")
+
+    if not venv_exists():
+        error("User venv not initialized")
+        print(f"\nRun: pyctl init")
+        return 1
+
+    success(f"Venv exists: {VENV_PATH}")
+
+    # Python version
+    python_bin = VENV_PATH / "bin" / "python3"
+    result = run_command([str(python_bin), "--version"])
+    print(f"Python: {result.stdout.strip()}")
+
+    # Pip version
+    pip_bin = VENV_PATH / "bin" / "pip"
+    result = run_command([str(pip_bin), "--version"])
+    print(f"Pip: {result.stdout.strip()}")
+
+    # Package count
+    freeze = pip_freeze()
+    pkg_count = len([l for l in freeze.split('\n') if l.strip() and not l.startswith('#')])
+    print(f"Installed packages: {pkg_count}")
+
+    # History count
+    history_count = len(list(HISTORY_PATH.glob("*_after.json")))
+    print(f"History entries: {history_count}")
+
+    # Snapshots
+    snapshots = list(SNAPSHOTS_PATH.glob("*.txt"))
+    print(f"Snapshots: {len(snapshots)}")
+    if snapshots:
+        print(f"  Available: {', '.join(s.stem for s in sorted(snapshots))}")
+
+    # PATH check
+    print("\nPATH check:")
+    user_path = os.getenv("PATH", "")
+    venv_bin_str = str(VENV_PATH / "bin")
+    if venv_bin_str in user_path:
+        if user_path.startswith(venv_bin_str):
+            success(f"  ✓ User venv is first in PATH")
+        else:
+            warning(f"  ⚠ User venv is in PATH but not first")
+    else:
+        error(f"  ✗ User venv not in PATH")
+        print(f"\n  Add to ~/.bashrc:")
+        cprint(f'  export PATH="{VENV_PATH}/bin:$PATH"', Colors.CYAN)
+
+    return 0
+
+
+def cmd_doctor(args):
+    """Health check and repair"""
+    heading("Running health checks")
+
+    issues = []
+
+    # Check if venv exists
+    if not venv_exists():
+        issues.append("User venv does not exist")
+    else:
+        success("User venv exists")
+
+    # Check directories
+    for path, name in [(HISTORY_PATH, "History"), (SNAPSHOTS_PATH, "Snapshots")]:
+        if not path.exists():
+            issues.append(f"{name} directory missing")
+        else:
+            success(f"{name} directory exists")
+
+    # Check Python binary
+    python_bin = VENV_PATH / "bin" / "python3"
+    if venv_exists() and python_bin.exists():
+        success("Python binary exists")
+    elif venv_exists():
+        issues.append("Python binary missing from venv")
+
+    # Check pip
+    pip_bin = VENV_PATH / "bin" / "pip"
+    if venv_exists() and pip_bin.exists():
+        success("Pip exists")
+    elif venv_exists():
+        issues.append("Pip missing from venv")
+
+    # Check PATH
+    user_path = os.getenv("PATH", "")
+    venv_bin_str = str(VENV_PATH / "bin")
+    if venv_bin_str in user_path:
+        success("Venv in PATH")
+    else:
+        warning("Venv not in PATH (add to shell config)")
+
+    # Check config
+    if CONFIG_PATH.exists():
+        success("Config file exists")
+    else:
+        issues.append("Config file missing")
+
+    # Summary
+    if issues:
+        heading(f"\nFound {len(issues)} issue(s):")
+        for issue in issues:
+            error(f"  • {issue}")
+
+        if args.fix:
+            heading("\nAttempting repairs...")
+            ensure_dirs()
+
+            if not venv_exists():
+                info("Creating venv...")
+                return cmd_init(args)
+
+            if not CONFIG_PATH.exists():
+                CONFIG_PATH.write_text(DEFAULT_CONFIG)
+                success("Created config file")
+
+            success("Repairs complete")
+            return 0
+        else:
+            print("\nRun with --fix to attempt repairs")
+            return 1
+    else:
+        success("\n✓ All checks passed!")
+        return 0
+
+
+def cmd_history(args):
+    """Show operation history"""
+    if not HISTORY_PATH.exists():
+        warning("No history yet")
+        return 0
+
+    # Get all after.json files (completed operations)
+    history_files = sorted(HISTORY_PATH.glob("*_after.json"))
+
+    if not history_files:
+        warning("No history yet")
+        return 0
+
+    # Apply limit
+    limit = args.limit if args.limit else len(history_files)
+    history_files = history_files[-limit:]
+
+    heading(f"Operation History (last {len(history_files)})")
+
+    for file in reversed(history_files):
+        with open(file) as f:
+            entry = json.load(f)
+
+        entry_id = entry.get("id", "?")
+        timestamp = entry.get("timestamp", "")
+        # Parse timestamp and format nicely
+        if timestamp:
+            dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            timestamp = dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        command = entry.get("command", "")
+
+        # Show changes summary
+        changes = entry.get("changes", {})
+        added = len(changes.get("added", []))
+        removed = len(changes.get("removed", []))
+        modified = len(changes.get("modified", []))
+
+        change_summary = []
+        if added:
+            change_summary.append(f"+{added}")
+        if removed:
+            change_summary.append(f"-{removed}")
+        if modified:
+            change_summary.append(f"~{modified}")
+
+        summary = f" [{', '.join(change_summary)}]" if change_summary else ""
+
+        print(f"#{entry_id:3d}  {timestamp}  {command}{summary}")
+
+    return 0
+
+
+def cmd_diff(args):
+    """Show diff from an operation"""
+    entry_id = args.entry_id
+
+    if entry_id is None:
+        # Show last operation
+        history_files = sorted(HISTORY_PATH.glob("*_after.json"))
+        if not history_files:
+            warning("No history yet")
+            return 0
+
+        with open(history_files[-1]) as f:
+            entry = json.load(f)
+        entry_id = entry.get("id")
+
+    # Load the after entry
+    after_file = HISTORY_PATH / f"{entry_id:03d}_after.json"
+    if not after_file.exists():
+        error(f"Operation #{entry_id} not found")
+        return 1
+
+    with open(after_file) as f:
+        entry = json.load(f)
+
+    heading(f"Operation #{entry_id}: {entry.get('command', '')}")
+
+    changes = entry.get("changes", {})
+    added = changes.get("added", [])
+    removed = changes.get("removed", [])
+    modified = changes.get("modified", [])
+
+    if added:
+        print("\nAdded:")
+        for pkg in added:
+            cprint(f"  + {pkg}", Colors.GREEN)
+
+    if removed:
+        print("\nRemoved:")
+        for pkg in removed:
+            cprint(f"  - {pkg}", Colors.RED)
+
+    if modified:
+        print("\nModified:")
+        for pkg in modified:
+            cprint(f"  ~ {pkg}", Colors.YELLOW)
+
+    if not added and not removed and not modified:
+        info("No changes")
+
+    return 0
+
+
+def cmd_undo(args):
+    """Undo last N operations"""
+    n = args.count
+
+    if not venv_exists():
+        error("User venv not initialized")
+        return 1
+
+    # Find the operation to roll back to
+    history_files = sorted(HISTORY_PATH.glob("*_after.json"))
+    if not history_files:
+        warning("No history to undo")
+        return 0
+
+    if n > len(history_files):
+        error(f"Only {len(history_files)} operations in history")
+        return 1
+
+    # We want to undo the last n operations
+    # So we restore to the state BEFORE operation (len - n + 1)
+    target_op = len(history_files) - n + 1
+
+    before_file = HISTORY_PATH / f"{target_op:03d}_before.json"
+    if not before_file.exists():
+        error(f"Cannot find state before operation #{target_op}")
+        return 1
+
+    with open(before_file) as f:
+        entry = json.load(f)
+
+    freeze_to_restore = entry.get("freeze", "")
+
+    heading(f"Rolling back {n} operation(s)")
+    info(f"Restoring to state before operation #{target_op}")
+
+    if args.dry_run:
+        warning("DRY RUN - no changes will be made")
+        print("\nWould restore packages:")
+        for line in freeze_to_restore.split('\n'):
+            if line.strip():
+                print(f"  {line}")
+        return 0
+
+    # Nuke and recreate venv
+    info("Removing current venv...")
+    shutil.rmtree(VENV_PATH)
+
+    info("Creating fresh venv...")
+    venv.create(VENV_PATH, with_pip=True, symlinks=True)
+
+    # Upgrade pip
+    pip_bin = VENV_PATH / "bin" / "pip"
+    run_command([str(pip_bin), "install", "--upgrade", "pip", "-q"])
+
+    # Restore packages
+    if freeze_to_restore.strip():
+        info("Restoring packages...")
+        # Write freeze to temp file
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            f.write(freeze_to_restore)
+            temp_file = f.name
+
+        try:
+            run_command([str(pip_bin), "install", "-r", temp_file, "-q"], capture=False)
+        finally:
+            os.unlink(temp_file)
+
+    success(f"Rolled back {n} operation(s)")
+
+    return 0
+
+
+def cmd_clean(args):
+    """Nuke and recreate venv"""
+    if not venv_exists():
+        warning("User venv doesn't exist, nothing to clean")
+        return 0
+
+    heading("Cleaning user venv")
+
+    restore_baseline = args.keep_baseline
+
+    if args.dry_run:
+        warning("DRY RUN - no changes will be made")
+        print("\nWould:")
+        print("  1. Delete venv")
+        print("  2. Create fresh venv")
+        if restore_baseline:
+            print("  3. Restore baseline snapshot")
+        return 0
+
+    # Check if baseline exists
+    baseline_file = SNAPSHOTS_PATH / "baseline.txt"
+    if restore_baseline and not baseline_file.exists():
+        error("Baseline snapshot not found")
+        return 1
+
+    # Nuke venv
+    info("Removing venv...")
+    shutil.rmtree(VENV_PATH)
+
+    # Recreate
+    info("Creating fresh venv...")
+    venv.create(VENV_PATH, with_pip=True, symlinks=True)
+
+    # Upgrade pip
+    pip_bin = VENV_PATH / "bin" / "pip"
+    run_command([str(pip_bin), "install", "--upgrade", "pip", "-q"])
+
+    # Restore baseline if requested
+    if restore_baseline:
+        info("Restoring baseline snapshot...")
+        freeze = baseline_file.read_text()
+        if freeze.strip():
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                f.write(freeze)
+                temp_file = f.name
+
+            try:
+                run_command([str(pip_bin), "install", "-r", temp_file, "-q"], capture=False)
+            finally:
+                os.unlink(temp_file)
+
+    success("Venv cleaned and recreated")
+
+    return 0
+
+
+def cmd_snapshot(args):
+    """Save named snapshot"""
+    name = args.name
+
+    if not venv_exists():
+        error("User venv not initialized")
+        return 1
+
+    snapshot_file = SNAPSHOTS_PATH / f"{name}.txt"
+
+    if snapshot_file.exists() and not args.force:
+        error(f"Snapshot '{name}' already exists (use --force to overwrite)")
+        return 1
+
+    freeze = pip_freeze()
+    snapshot_file.write_text(freeze)
+
+    success(f"Saved snapshot '{name}'")
+
+    return 0
+
+
+def cmd_restore(args):
+    """Restore named snapshot"""
+    name = args.name
+
+    if not venv_exists():
+        error("User venv not initialized")
+        return 1
+
+    snapshot_file = SNAPSHOTS_PATH / f"{name}.txt"
+
+    if not snapshot_file.exists():
+        error(f"Snapshot '{name}' not found")
+        return 1
+
+    freeze = snapshot_file.read_text()
+
+    heading(f"Restoring snapshot '{name}'")
+
+    if args.dry_run:
+        warning("DRY RUN - no changes will be made")
+        print("\nWould restore packages:")
+        for line in freeze.split('\n'):
+            if line.strip():
+                print(f"  {line}")
+        return 0
+
+    # Nuke and recreate venv
+    info("Removing current venv...")
+    shutil.rmtree(VENV_PATH)
+
+    info("Creating fresh venv...")
+    venv.create(VENV_PATH, with_pip=True, symlinks=True)
+
+    # Upgrade pip
+    pip_bin = VENV_PATH / "bin" / "pip"
+    run_command([str(pip_bin), "install", "--upgrade", "pip", "-q"])
+
+    # Restore packages
+    if freeze.strip():
+        info("Restoring packages...")
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            f.write(freeze)
+            temp_file = f.name
+
+        try:
+            run_command([str(pip_bin), "install", "-r", temp_file, "-q"], capture=False)
+        finally:
+            os.unlink(temp_file)
+
+    success(f"Restored snapshot '{name}'")
+
+    return 0
+
+
+def cmd_list_snapshots(args):
+    """List available snapshots"""
+    snapshots = sorted(SNAPSHOTS_PATH.glob("*.txt"))
+
+    if not snapshots:
+        warning("No snapshots yet")
+        return 0
+
+    heading("Available Snapshots")
+
+    for snap in snapshots:
+        name = snap.stem
+        size = snap.stat().st_size
+        mtime = datetime.fromtimestamp(snap.stat().st_mtime)
+
+        # Count packages
+        freeze = snap.read_text()
+        pkg_count = len([l for l in freeze.split('\n') if l.strip() and not l.startswith('#')])
+
+        print(f"  {name:20s}  {pkg_count:3d} packages  {mtime.strftime('%Y-%m-%d %H:%M')}")
+
+    return 0
+
+
+# ============================================================================
+# Internal commands (used by pip wrapper)
+# ============================================================================
+
+def cmd_snapshot_before(args):
+    """Internal: Take before snapshot"""
+    ensure_dirs()
+
+    entry_id = get_history_id()
+    freeze = pip_freeze()
+
+    entry = {
+        "id": entry_id,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "user": os.getenv("USER", "unknown"),
+        "command": " ".join(args.command),
+        "pip_args": args.command,
+        "freeze": freeze
+    }
+
+    before_file = HISTORY_PATH / f"{entry_id:03d}_before.json"
+    with open(before_file, 'w') as f:
+        json.dump(entry, f, indent=2)
+
+    return 0
+
+
+def cmd_snapshot_after(args):
+    """Internal: Take after snapshot"""
+    # Find the most recent before snapshot
+    before_files = sorted(HISTORY_PATH.glob("*_before.json"))
+    if not before_files:
+        return 0
+
+    before_file = before_files[-1]
+    with open(before_file) as f:
+        before_entry = json.load(f)
+
+    entry_id = before_entry["id"]
+    before_freeze = before_entry["freeze"]
+    after_freeze = pip_freeze()
+
+    # Calculate diff
+    added, removed, modified = diff_packages(before_freeze, after_freeze)
+
+    after_entry = before_entry.copy()
+    after_entry["freeze"] = after_freeze
+    after_entry["changes"] = {
+        "added": added,
+        "removed": removed,
+        "modified": modified
+    }
+    after_entry["exit_code"] = 0
+
+    after_file = HISTORY_PATH / f"{entry_id:03d}_after.json"
+    with open(after_file, 'w') as f:
+        json.dump(after_entry, f, indent=2)
+
+    # Show diff
+    if added or removed or modified:
+        heading("Changes:")
+        if added:
+            for pkg in added:
+                cprint(f"  + {pkg}", Colors.GREEN)
+        if removed:
+            for pkg in removed:
+                cprint(f"  - {pkg}", Colors.RED)
+        if modified:
+            for pkg in modified:
+                cprint(f"  ~ {pkg}", Colors.YELLOW)
+
+        info(f"Saved as operation #{entry_id}")
+
+    return 0
+
+
+# ============================================================================
+# CLI Setup
+# ============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Two-Tier Python Package System Manager",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+
+    subparsers = parser.add_subparsers(dest='command', help='Command to run')
+
+    # init
+    parser_init = subparsers.add_parser('init', help='Initialize user venv')
+    parser_init.set_defaults(func=cmd_init)
+
+    # status
+    parser_status = subparsers.add_parser('status', help='Show current status')
+    parser_status.set_defaults(func=cmd_status)
+
+    # doctor
+    parser_doctor = subparsers.add_parser('doctor', help='Health check and repair')
+    parser_doctor.add_argument('--fix', action='store_true', help='Attempt to fix issues')
+    parser_doctor.set_defaults(func=cmd_doctor)
+
+    # history
+    parser_history = subparsers.add_parser('history', help='Show operation history')
+    parser_history.add_argument('--limit', type=int, help='Limit number of entries')
+    parser_history.set_defaults(func=cmd_history)
+
+    # diff
+    parser_diff = subparsers.add_parser('diff', help='Show changes from operation')
+    parser_diff.add_argument('entry_id', type=int, nargs='?', help='Operation ID (default: last)')
+    parser_diff.set_defaults(func=cmd_diff)
+
+    # undo
+    parser_undo = subparsers.add_parser('undo', help='Undo last N operations')
+    parser_undo.add_argument('count', type=int, nargs='?', default=1, help='Number of operations to undo')
+    parser_undo.add_argument('--dry-run', action='store_true', help='Show what would be done')
+    parser_undo.set_defaults(func=cmd_undo)
+
+    # clean
+    parser_clean = subparsers.add_parser('clean', help='Nuke and recreate venv')
+    parser_clean.add_argument('--keep-baseline', action='store_true', help='Restore baseline after clean')
+    parser_clean.add_argument('--dry-run', action='store_true', help='Show what would be done')
+    parser_clean.set_defaults(func=cmd_clean)
+
+    # snapshot
+    parser_snapshot = subparsers.add_parser('snapshot', help='Save named snapshot')
+    parser_snapshot.add_argument('name', help='Snapshot name')
+    parser_snapshot.add_argument('--force', action='store_true', help='Overwrite existing snapshot')
+    parser_snapshot.set_defaults(func=cmd_snapshot)
+
+    # restore
+    parser_restore = subparsers.add_parser('restore', help='Restore named snapshot')
+    parser_restore.add_argument('name', help='Snapshot name')
+    parser_restore.add_argument('--dry-run', action='store_true', help='Show what would be done')
+    parser_restore.set_defaults(func=cmd_restore)
+
+    # list-snapshots
+    parser_list = subparsers.add_parser('list-snapshots', help='List available snapshots')
+    parser_list.set_defaults(func=cmd_list_snapshots)
+
+    # Internal commands (used by pip wrapper)
+    parser_sb = subparsers.add_parser('_snapshot-before', help=argparse.SUPPRESS)
+    parser_sb.add_argument('command', nargs='+')
+    parser_sb.set_defaults(func=cmd_snapshot_before)
+
+    parser_sa = subparsers.add_parser('_snapshot-after', help=argparse.SUPPRESS)
+    parser_sa.add_argument('command', nargs='+')
+    parser_sa.set_defaults(func=cmd_snapshot_after)
+
+    # Parse and run
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return 1
+
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        print("\n\nInterrupted")
+        return 130
+    except Exception as e:
+        error(f"Unexpected error: {e}")
+        if os.getenv("DEBUG"):
+            raise
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
