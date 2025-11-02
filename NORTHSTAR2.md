@@ -85,6 +85,204 @@ Linux distributions should ship with a **two-tier Python package architecture**:
 
 ---
 
+## Python Binary Layout & System Integration
+
+### How System Components Use the System Venv
+
+**Core Design:** The system venv IS the system Python. Not "contains system packages" but literally IS where the system Python lives.
+
+```
+/opt/system-python/
+└── venv/
+    ├── bin/
+    │   ├── python3          # The actual system Python binary
+    │   ├── pip3             # System pip
+    │   └── ...
+    └── lib/
+        └── python3.11/
+            └── site-packages/
+                ├── distro-pkg-1/    # Distro-installed packages
+                ├── distro-pkg-2/
+                └── ...
+
+# Standard system Python location is a symlink
+/usr/bin/python3 -> /opt/system-python/venv/bin/python3
+/usr/bin/pip3    -> /opt/system-python/venv/bin/pip3
+```
+
+**When system services run:**
+```python
+#!/usr/bin/python3
+# System service script
+
+# This resolves to /usr/bin/python3
+# Which is /opt/system-python/venv/bin/python3
+# So it automatically gets packages from the system venv
+import distro_package  # Works - it's in /opt/system-python/venv/lib/python3.11/site-packages
+```
+
+### How Users' Python Gets Resolved
+
+**User's shell environment (after setup):**
+```bash
+# ~/.bashrc adds user venv to PATH first
+PATH="$HOME/.local/python-packages/venv/bin:$PATH"
+
+# So when user types:
+$ python3
+
+# PATH resolution order:
+# 1. ~/.local/python-packages/venv/bin/python3  ← FOUND HERE (user's Python)
+# 2. /usr/bin/python3                           ← Not reached (system Python)
+```
+
+**Visual PATH precedence:**
+```
+User types: python3
+
+PATH search:
+  ~/.local/python-packages/venv/bin/python3  ✓ MATCH
+    └─> Uses user's venv packages
+
+  /usr/bin/python3 (symlink)
+    └─> /opt/system-python/venv/bin/python3
+        └─> Would use system venv packages (not reached)
+```
+
+### Complete Isolation Through PATH
+
+**System processes (no user PATH):**
+```bash
+# systemd service running as root
+[Service]
+ExecStart=/usr/bin/python3 /opt/app/script.py
+
+# Directly calls /usr/bin/python3
+# → /opt/system-python/venv/bin/python3
+# → Sees only system packages
+```
+
+**User processes (with user PATH):**
+```bash
+# User's shell
+$ python3 my_script.py
+
+# PATH has ~/.local/python-packages/venv/bin first
+# → Uses ~/.local/python-packages/venv/bin/python3
+# → Sees only user packages (plus stdlib)
+```
+
+**Project-local venv (highest precedence):**
+```bash
+# User activates project venv
+$ source myproject/venv/bin/activate
+
+# PATH now:
+PATH="myproject/venv/bin:$HOME/.local/python-packages/venv/bin:$PATH"
+
+$ python3
+# → Uses myproject/venv/bin/python3
+# → Project venv wins
+```
+
+### Layer Precedence Diagram
+
+```
+┌─────────────────────────────────────────┐
+│  Project venv (if activated)            │
+│  myproject/venv/bin/python3             │
+│  Highest priority in PATH               │
+└─────────────────────────────────────────┘
+              ↓ (if not found)
+┌─────────────────────────────────────────┐
+│  User venv (always in user's PATH)      │
+│  ~/.local/python-packages/venv/bin/     │
+│  Default for user commands              │
+└─────────────────────────────────────────┘
+              ↓ (if not in PATH)
+┌─────────────────────────────────────────┐
+│  System venv (symlinked from /usr/bin)  │
+│  /opt/system-python/venv/bin/           │
+│  Used by system services                │
+└─────────────────────────────────────────┘
+```
+
+### Installation on a Fresh System
+
+**Distro package manager installs:**
+```bash
+# 1. Create system venv
+python3 -m venv /opt/system-python/venv
+
+# 2. Symlink from standard locations
+ln -sf /opt/system-python/venv/bin/python3 /usr/bin/python3
+ln -sf /opt/system-python/venv/bin/pip3 /usr/bin/pip3
+
+# 3. Install distro Python packages
+/opt/system-python/venv/bin/pip install distro-pkg-1 distro-pkg-2
+
+# 4. Lock down system venv (read-only for non-root)
+chown -R root:root /opt/system-python
+chmod -R 755 /opt/system-python
+```
+
+**User setup (on first login or manual install):**
+```bash
+# User runs: curl -sSL install.sh | sh
+# OR: pyctl init
+
+# 1. Create user venv
+python3 -m venv ~/.local/python-packages/venv
+
+# 2. Add to shell config
+echo 'export PATH="$HOME/.local/python-packages/venv/bin:$PATH"' >> ~/.bashrc
+
+# 3. Install pip wrapper (optional, for snapshot features)
+# Wrapper is smart: if $VIRTUAL_ENV is set, don't intercept
+```
+
+### Why This Works Cleanly
+
+✅ **Complete isolation:** User packages can't break system
+✅ **No PYTHONPATH hacks:** Pure PATH-based resolution
+✅ **No magic imports:** Standard Python import behavior
+✅ **Composable:** Project venvs work normally (just higher in PATH)
+✅ **Transparent:** Users can `which python3` and see exactly what they're using
+✅ **Uninstallable:** Remove from PATH, back to system Python
+
+### Verification Commands
+
+**See which Python you're using:**
+```bash
+$ which python3
+/home/user/.local/python-packages/venv/bin/python3  # User Python
+
+$ sudo which python3
+/usr/bin/python3  # System Python (root has no user PATH)
+```
+
+**See where packages are installed:**
+```bash
+$ python3 -m site
+# Shows:
+# USER_SITE: ~/.local/python-packages/venv/lib/python3.11/site-packages
+
+$ sudo python3 -m site
+# Shows:
+# USER_SITE: /opt/system-python/venv/lib/python3.11/site-packages
+```
+
+**Verify pip routing:**
+```bash
+$ pip --version
+pip 24.0 from /home/user/.local/python-packages/venv/lib/python3.11/site-packages
+
+$ sudo pip --version
+pip 24.0 from /opt/system-python/venv/lib/python3.11/site-packages
+```
+
+---
+
 ## User Experience
 
 ### First-Time Setup
