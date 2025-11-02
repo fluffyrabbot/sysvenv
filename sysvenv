@@ -98,16 +98,35 @@ def heading(text: str):
 # ============================================================================
 
 def run_command(cmd: List[str], capture: bool = True, check: bool = True) -> subprocess.CompletedProcess:
-    """Run a shell command"""
+    """Run a shell command with better error handling"""
     try:
         if capture:
-            return subprocess.run(cmd, capture_output=True, text=True, check=check)
+            return subprocess.run(cmd, capture_output=True, text=True, check=check, timeout=300)
         else:
-            return subprocess.run(cmd, check=check)
+            return subprocess.run(cmd, check=check, timeout=300)
+    except subprocess.TimeoutExpired:
+        error(f"Command timed out after 5 minutes: {' '.join(cmd)}")
+        error("This might indicate network issues or a very large package")
+        raise
     except subprocess.CalledProcessError as e:
         error(f"Command failed: {' '.join(cmd)}")
         if e.stderr:
-            print(e.stderr, file=sys.stderr)
+            stderr = e.stderr.strip()
+            print(f"\n{stderr}", file=sys.stderr)
+
+            # Provide helpful context for common errors
+            if "No space left on device" in stderr:
+                print("\n💡 Tip: Free up disk space and try again", file=sys.stderr)
+            elif "Could not find a version" in stderr or "No matching distribution" in stderr:
+                print("\n💡 Tip: Check package name spelling or try a different version", file=sys.stderr)
+            elif "Connection" in stderr or "Network" in stderr or "timed out" in stderr:
+                print("\n💡 Tip: Check your internet connection and try again", file=sys.stderr)
+            elif "Permission denied" in stderr:
+                print("\n💡 Tip: Check file permissions or run with appropriate access", file=sys.stderr)
+        raise
+    except FileNotFoundError:
+        error(f"Command not found: {cmd[0]}")
+        error("Make sure all required tools are installed")
         raise
 
 
@@ -183,6 +202,55 @@ def diff_packages(before: str, after: str) -> Tuple[List[str], List[str], List[s
     return added, removed, modified
 
 
+def check_disk_space(path: Path, required_mb: int = 100) -> bool:
+    """Check if there's enough disk space available"""
+    try:
+        stat = os.statvfs(path.parent if path.is_file() else path)
+        # Available space in MB
+        available_mb = (stat.f_bavail * stat.f_frsize) / (1024 * 1024)
+        return available_mb >= required_mb
+    except Exception:
+        # If we can't check, assume it's okay
+        return True
+
+
+def validate_snapshot_name(name: str) -> bool:
+    """Validate snapshot name (alphanumeric, dash, underscore only)"""
+    import re
+    return bool(re.match(r'^[a-zA-Z0-9_-]+$', name))
+
+
+def confirm_action(message: str, default: bool = False) -> bool:
+    """Ask user for confirmation"""
+    if os.getenv("SYSVENV_YES"):
+        return True
+
+    prompt = f"{message} [y/N]: " if not default else f"{message} [Y/n]: "
+    try:
+        response = input(prompt).strip().lower()
+        if not response:
+            return default
+        return response in ['y', 'yes']
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return False
+
+
+def safe_read_json(file_path: Path) -> Optional[Dict]:
+    """Safely read JSON file with error handling"""
+    try:
+        with open(file_path) as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        warning(f"Corrupted JSON file: {file_path}")
+        return None
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        warning(f"Error reading {file_path}: {e}")
+        return None
+
+
 # ============================================================================
 # Commands
 # ============================================================================
@@ -194,39 +262,56 @@ def cmd_init(args):
     if venv_exists():
         warning("User venv already exists")
         info(f"Location: {VENV_PATH}")
+        if not confirm_action("Reinitialize (this will delete existing venv)?"):
+            return 0
+        info("Removing existing venv...")
+        shutil.rmtree(VENV_PATH)
+
+    # Check disk space
+    if not check_disk_space(SYSVENV_ROOT, 500):
+        error("Low disk space (need at least 500MB)")
+        error(f"Location: {SYSVENV_ROOT}")
+        return 1
+
+    try:
+        ensure_dirs()
+
+        # Create venv
+        info("Creating virtual environment...")
+        venv.create(VENV_PATH, with_pip=True, symlinks=True)
+        success(f"Created venv at {VENV_PATH}")
+
+        # Upgrade pip
+        info("Upgrading pip...")
+        pip_bin = VENV_PATH / "bin" / "pip"
+        run_command([str(pip_bin), "install", "--upgrade", "pip"], capture=False)
+
+        # Create baseline snapshot
+        baseline_file = SNAPSHOTS_PATH / "baseline.txt"
+        freeze = pip_freeze()
+        baseline_file.write_text(freeze)
+        success("Created baseline snapshot")
+
+        # Create default config if it doesn't exist
+        if not CONFIG_PATH.exists():
+            CONFIG_PATH.write_text(DEFAULT_CONFIG)
+            success("Created default config")
+
+        heading("Setup complete!")
+        print("\nNext steps:")
+        print(f"  1. Add to your shell config (~/.bashrc or ~/.zshrc):")
+        cprint(f'     export PATH="{VENV_PATH}/bin:$PATH"', Colors.CYAN)
+        print(f"  2. Reload shell: source ~/.bashrc")
+        print(f"  3. Start installing: pip install <package>")
+
         return 0
 
-    ensure_dirs()
-
-    # Create venv
-    info("Creating virtual environment...")
-    venv.create(VENV_PATH, with_pip=True, symlinks=True)
-    success(f"Created venv at {VENV_PATH}")
-
-    # Upgrade pip
-    info("Upgrading pip...")
-    pip_bin = VENV_PATH / "bin" / "pip"
-    run_command([str(pip_bin), "install", "--upgrade", "pip"], capture=False)
-
-    # Create baseline snapshot
-    baseline_file = SNAPSHOTS_PATH / "baseline.txt"
-    freeze = pip_freeze()
-    baseline_file.write_text(freeze)
-    success("Created baseline snapshot")
-
-    # Create default config if it doesn't exist
-    if not CONFIG_PATH.exists():
-        CONFIG_PATH.write_text(DEFAULT_CONFIG)
-        success("Created default config")
-
-    heading("Setup complete!")
-    print("\nNext steps:")
-    print(f"  1. Add to your shell config (~/.bashrc or ~/.zshrc):")
-    cprint(f'     export PATH="{VENV_PATH}/bin:$PATH"', Colors.CYAN)
-    print(f"  2. Reload shell: source ~/.bashrc")
-    print(f"  3. Start installing: pip install <package>")
-
-    return 0
+    except Exception as e:
+        error(f"Initialization failed: {e}")
+        error("Rolling back...")
+        if VENV_PATH.exists():
+            shutil.rmtree(VENV_PATH)
+        return 1
 
 
 def cmd_status(args):
@@ -376,16 +461,22 @@ def cmd_history(args):
 
     heading(f"Operation History (last {len(history_files)})")
 
+    corrupted_count = 0
     for file in reversed(history_files):
-        with open(file) as f:
-            entry = json.load(f)
+        entry = safe_read_json(file)
+        if not entry:
+            corrupted_count += 1
+            continue
 
         entry_id = entry.get("id", "?")
         timestamp = entry.get("timestamp", "")
         # Parse timestamp and format nicely
         if timestamp:
-            dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-            timestamp = dt.strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                timestamp = dt.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                timestamp = "unknown"
 
         command = entry.get("command", "")
 
@@ -406,6 +497,9 @@ def cmd_history(args):
         summary = f" [{', '.join(change_summary)}]" if change_summary else ""
 
         print(f"#{entry_id:3d}  {timestamp}  {command}{summary}")
+
+    if corrupted_count > 0:
+        warning(f"\n{corrupted_count} corrupted history entries skipped")
 
     return 0
 
@@ -466,6 +560,10 @@ def cmd_undo(args):
     """Undo last N operations"""
     n = args.count
 
+    if n < 1:
+        error("Count must be at least 1")
+        return 1
+
     if not venv_exists():
         error("User venv not initialized")
         return 1
@@ -489,8 +587,10 @@ def cmd_undo(args):
         error(f"Cannot find state before operation #{target_op}")
         return 1
 
-    with open(before_file) as f:
-        entry = json.load(f)
+    entry = safe_read_json(before_file)
+    if not entry:
+        error("Corrupted history file")
+        return 1
 
     freeze_to_restore = entry.get("freeze", "")
 
@@ -505,34 +605,49 @@ def cmd_undo(args):
                 print(f"  {line}")
         return 0
 
-    # Nuke and recreate venv
-    info("Removing current venv...")
-    shutil.rmtree(VENV_PATH)
+    # Confirm if undoing more than 1 operation
+    if n > 1 and not confirm_action(f"Undo last {n} operations?"):
+        info("Cancelled")
+        return 0
 
-    info("Creating fresh venv...")
-    venv.create(VENV_PATH, with_pip=True, symlinks=True)
+    # Check disk space
+    if not check_disk_space(SYSVENV_ROOT, 500):
+        error("Low disk space (need at least 500MB)")
+        return 1
 
-    # Upgrade pip
-    pip_bin = VENV_PATH / "bin" / "pip"
-    run_command([str(pip_bin), "install", "--upgrade", "pip", "-q"])
+    try:
+        # Nuke and recreate venv
+        info("Removing current venv...")
+        shutil.rmtree(VENV_PATH)
 
-    # Restore packages
-    if freeze_to_restore.strip():
-        info("Restoring packages...")
-        # Write freeze to temp file
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-            f.write(freeze_to_restore)
-            temp_file = f.name
+        info("Creating fresh venv...")
+        venv.create(VENV_PATH, with_pip=True, symlinks=True)
 
-        try:
-            run_command([str(pip_bin), "install", "-r", temp_file, "-q"], capture=False)
-        finally:
-            os.unlink(temp_file)
+        # Upgrade pip
+        pip_bin = VENV_PATH / "bin" / "pip"
+        run_command([str(pip_bin), "install", "--upgrade", "pip", "-q"])
 
-    success(f"Rolled back {n} operation(s)")
+        # Restore packages
+        if freeze_to_restore.strip():
+            info("Restoring packages...")
+            # Write freeze to temp file
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                f.write(freeze_to_restore)
+                temp_file = f.name
 
-    return 0
+            try:
+                run_command([str(pip_bin), "install", "-r", temp_file, "-q"], capture=False)
+            finally:
+                os.unlink(temp_file)
+
+        success(f"Rolled back {n} operation(s)")
+        return 0
+
+    except Exception as e:
+        error(f"Undo failed: {e}")
+        error("Your venv may be in an inconsistent state. Run 'sysvenv doctor --fix' to repair.")
+        return 1
 
 
 def cmd_clean(args):
@@ -554,42 +669,57 @@ def cmd_clean(args):
             print("  3. Restore baseline snapshot")
         return 0
 
+    # Confirm deletion
+    if not confirm_action("This will delete all installed packages. Continue?"):
+        info("Cancelled")
+        return 0
+
     # Check if baseline exists
     baseline_file = SNAPSHOTS_PATH / "baseline.txt"
     if restore_baseline and not baseline_file.exists():
         error("Baseline snapshot not found")
         return 1
 
-    # Nuke venv
-    info("Removing venv...")
-    shutil.rmtree(VENV_PATH)
+    # Check disk space
+    if not check_disk_space(SYSVENV_ROOT, 500):
+        error("Low disk space (need at least 500MB)")
+        return 1
 
-    # Recreate
-    info("Creating fresh venv...")
-    venv.create(VENV_PATH, with_pip=True, symlinks=True)
+    try:
+        # Nuke venv
+        info("Removing venv...")
+        shutil.rmtree(VENV_PATH)
 
-    # Upgrade pip
-    pip_bin = VENV_PATH / "bin" / "pip"
-    run_command([str(pip_bin), "install", "--upgrade", "pip", "-q"])
+        # Recreate
+        info("Creating fresh venv...")
+        venv.create(VENV_PATH, with_pip=True, symlinks=True)
 
-    # Restore baseline if requested
-    if restore_baseline:
-        info("Restoring baseline snapshot...")
-        freeze = baseline_file.read_text()
-        if freeze.strip():
-            import tempfile
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-                f.write(freeze)
-                temp_file = f.name
+        # Upgrade pip
+        pip_bin = VENV_PATH / "bin" / "pip"
+        run_command([str(pip_bin), "install", "--upgrade", "pip", "-q"])
 
-            try:
-                run_command([str(pip_bin), "install", "-r", temp_file, "-q"], capture=False)
-            finally:
-                os.unlink(temp_file)
+        # Restore baseline if requested
+        if restore_baseline:
+            info("Restoring baseline snapshot...")
+            freeze = baseline_file.read_text()
+            if freeze.strip():
+                import tempfile
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                    f.write(freeze)
+                    temp_file = f.name
 
-    success("Venv cleaned and recreated")
+                try:
+                    run_command([str(pip_bin), "install", "-r", temp_file, "-q"], capture=False)
+                finally:
+                    os.unlink(temp_file)
 
-    return 0
+        success("Venv cleaned and recreated")
+        return 0
+
+    except Exception as e:
+        error(f"Clean failed: {e}")
+        error("Your venv may be in an inconsistent state. Run 'sysvenv doctor --fix' to repair.")
+        return 1
 
 
 def cmd_snapshot(args):
@@ -600,18 +730,32 @@ def cmd_snapshot(args):
         error("User venv not initialized")
         return 1
 
+    # Validate snapshot name
+    if not validate_snapshot_name(name):
+        error(f"Invalid snapshot name: '{name}'")
+        error("Use only alphanumeric characters, dashes, and underscores")
+        return 1
+
     snapshot_file = SNAPSHOTS_PATH / f"{name}.txt"
 
     if snapshot_file.exists() and not args.force:
         error(f"Snapshot '{name}' already exists (use --force to overwrite)")
+        info(f"Existing snapshots: sysvenv list-snapshots")
         return 1
 
-    freeze = pip_freeze()
-    snapshot_file.write_text(freeze)
+    try:
+        freeze = pip_freeze()
+        snapshot_file.write_text(freeze)
 
-    success(f"Saved snapshot '{name}'")
+        # Count packages
+        pkg_count = len([l for l in freeze.split('\n') if l.strip() and not l.startswith('#')])
+        success(f"Saved snapshot '{name}' ({pkg_count} packages)")
 
-    return 0
+        return 0
+
+    except Exception as e:
+        error(f"Failed to save snapshot: {e}")
+        return 1
 
 
 def cmd_restore(args):
@@ -626,11 +770,13 @@ def cmd_restore(args):
 
     if not snapshot_file.exists():
         error(f"Snapshot '{name}' not found")
+        info("Available snapshots: sysvenv list-snapshots")
         return 1
 
     freeze = snapshot_file.read_text()
+    pkg_count = len([l for l in freeze.split('\n') if l.strip() and not l.startswith('#')])
 
-    heading(f"Restoring snapshot '{name}'")
+    heading(f"Restoring snapshot '{name}' ({pkg_count} packages)")
 
     if args.dry_run:
         warning("DRY RUN - no changes will be made")
@@ -640,33 +786,48 @@ def cmd_restore(args):
                 print(f"  {line}")
         return 0
 
-    # Nuke and recreate venv
-    info("Removing current venv...")
-    shutil.rmtree(VENV_PATH)
+    # Confirm restoration
+    if not confirm_action(f"This will delete current venv and restore '{name}'. Continue?"):
+        info("Cancelled")
+        return 0
 
-    info("Creating fresh venv...")
-    venv.create(VENV_PATH, with_pip=True, symlinks=True)
+    # Check disk space
+    if not check_disk_space(SYSVENV_ROOT, 500):
+        error("Low disk space (need at least 500MB)")
+        return 1
 
-    # Upgrade pip
-    pip_bin = VENV_PATH / "bin" / "pip"
-    run_command([str(pip_bin), "install", "--upgrade", "pip", "-q"])
+    try:
+        # Nuke and recreate venv
+        info("Removing current venv...")
+        shutil.rmtree(VENV_PATH)
 
-    # Restore packages
-    if freeze.strip():
-        info("Restoring packages...")
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-            f.write(freeze)
-            temp_file = f.name
+        info("Creating fresh venv...")
+        venv.create(VENV_PATH, with_pip=True, symlinks=True)
 
-        try:
-            run_command([str(pip_bin), "install", "-r", temp_file, "-q"], capture=False)
-        finally:
-            os.unlink(temp_file)
+        # Upgrade pip
+        pip_bin = VENV_PATH / "bin" / "pip"
+        run_command([str(pip_bin), "install", "--upgrade", "pip", "-q"])
 
-    success(f"Restored snapshot '{name}'")
+        # Restore packages
+        if freeze.strip():
+            info("Restoring packages...")
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                f.write(freeze)
+                temp_file = f.name
 
-    return 0
+            try:
+                run_command([str(pip_bin), "install", "-r", temp_file, "-q"], capture=False)
+            finally:
+                os.unlink(temp_file)
+
+        success(f"Restored snapshot '{name}'")
+        return 0
+
+    except Exception as e:
+        error(f"Restore failed: {e}")
+        error("Your venv may be in an inconsistent state. Run 'sysvenv doctor --fix' to repair.")
+        return 1
 
 
 def cmd_list_snapshots(args):
@@ -779,6 +940,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
+    # Global options
+    parser.add_argument('-y', '--yes', action='store_true',
+                        help='Skip confirmation prompts')
+
     subparsers = parser.add_subparsers(dest='command', help='Command to run')
 
     # init
@@ -847,6 +1012,10 @@ def main():
     if not args.command:
         parser.print_help()
         return 1
+
+    # Set SYSVENV_YES if --yes flag provided
+    if getattr(args, 'yes', False):
+        os.environ["SYSVENV_YES"] = "1"
 
     try:
         return args.func(args)
