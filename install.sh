@@ -14,7 +14,7 @@ set -e
 # ============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYCTL_SCRIPT="$SCRIPT_DIR/pyctl"
+PYCTL_SCRIPT="$SCRIPT_DIR/sysvenv"
 PIP_WRAPPER="$SCRIPT_DIR/pip-wrapper"
 
 # Colors
@@ -67,7 +67,7 @@ check_prereqs() {
 
     # Check for required scripts
     if [ ! -f "$PYCTL_SCRIPT" ]; then
-        error "pyctl script not found at $PYCTL_SCRIPT"
+        error "sysvenv script not found at $PYCTL_SCRIPT"
         exit 1
     fi
 
@@ -88,11 +88,11 @@ install_user() {
     LOCAL_BIN="$HOME/.local/bin"
     mkdir -p "$LOCAL_BIN"
 
-    # Install pyctl
-    info "Installing pyctl to $LOCAL_BIN..."
-    cp "$PYCTL_SCRIPT" "$LOCAL_BIN/pyctl"
-    chmod +x "$LOCAL_BIN/pyctl"
-    success "Installed pyctl"
+    # Install sysvenv
+    info "Installing sysvenv to $LOCAL_BIN..."
+    cp "$PYCTL_SCRIPT" "$LOCAL_BIN/sysvenv"
+    chmod +x "$LOCAL_BIN/sysvenv"
+    success "Installed sysvenv"
 
     # Note: We don't install pip wrapper for user-only install
     # It would conflict with system pip
@@ -114,14 +114,14 @@ install_user() {
     esac
 
     # Add PATH to shell config if not already there
-    SHELL_CONFIG_LINE='export PATH="$HOME/.local/bin:$PATH"  # pyctl'
+    SHELL_CONFIG_LINE='export PATH="$HOME/.local/bin:$PATH"  # sysvenv'
 
     if [ -f "$SHELL_RC" ] && grep -q "\.local/bin" "$SHELL_RC"; then
         info "$SHELL_RC already has .local/bin in PATH"
     else
         info "Adding .local/bin to PATH in $SHELL_RC..."
         echo "" >> "$SHELL_RC"
-        echo "# Added by pyctl installer" >> "$SHELL_RC"
+        echo "# Added by sysvenv installer" >> "$SHELL_RC"
         echo "$SHELL_CONFIG_LINE" >> "$SHELL_RC"
         success "Updated $SHELL_RC"
     fi
@@ -129,10 +129,10 @@ install_user() {
     # Initialize user venv
     heading "Initializing user venv"
 
-    # Source the shell config to get pyctl in PATH for this script
+    # Source the shell config to get sysvenv in PATH for this script
     export PATH="$LOCAL_BIN:$PATH"
 
-    pyctl init
+    sysvenv init
 
     heading "Installation complete!"
     echo ""
@@ -141,7 +141,7 @@ install_user() {
     echo "     source $SHELL_RC"
     echo ""
     echo "  2. Verify installation:"
-    echo "     pyctl status"
+    echo "     sysvenv status"
     echo ""
     echo "  3. Install packages:"
     echo "     pip install <package>"
@@ -163,11 +163,11 @@ install_system() {
         exit 1
     fi
 
-    # Install pyctl
-    info "Installing pyctl to /usr/local/bin..."
-    cp "$PYCTL_SCRIPT" /usr/local/bin/pyctl
-    chmod +x /usr/local/bin/pyctl
-    success "Installed pyctl"
+    # Install sysvenv
+    info "Installing sysvenv to /usr/local/bin..."
+    cp "$PYCTL_SCRIPT" /usr/local/bin/sysvenv
+    chmod +x /usr/local/bin/sysvenv
+    success "Installed sysvenv"
 
     # Install pip wrapper
     # We'll create symlinks for pip, pip3, etc.
@@ -226,7 +226,7 @@ install_system() {
     heading "System installation complete!"
     echo ""
     echo "Users can now run:"
-    echo "  pyctl init    # Initialize their user venv"
+    echo "  sysvenv init    # Initialize their user venv"
     echo ""
 
     return 0

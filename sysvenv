@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-pyctl - Two-Tier Python Package System Manager
+sysvenv - Two-Tier Python Package System Manager
 
 Manages user-level Python virtual environment with automatic snapshots,
 history tracking, and easy undo/rollback capabilities.
@@ -23,11 +23,11 @@ import venv
 # ============================================================================
 
 HOME = Path.home()
-PYCTL_ROOT = HOME / ".local" / "python-packages"
-VENV_PATH = PYCTL_ROOT / "venv"
-HISTORY_PATH = PYCTL_ROOT / "history"
-SNAPSHOTS_PATH = PYCTL_ROOT / "snapshots"
-CONFIG_PATH = PYCTL_ROOT / "config.toml"
+SYSVENV_ROOT = HOME / ".local" / "python-packages"
+VENV_PATH = SYSVENV_ROOT / "venv"
+HISTORY_PATH = SYSVENV_ROOT / "history"
+SNAPSHOTS_PATH = SYSVENV_ROOT / "snapshots"
+CONFIG_PATH = SYSVENV_ROOT / "config.toml"
 
 DEFAULT_CONFIG = """[history]
 max_entries = 100
@@ -143,7 +143,7 @@ def venv_exists() -> bool:
 
 def ensure_dirs():
     """Ensure all necessary directories exist"""
-    PYCTL_ROOT.mkdir(parents=True, exist_ok=True)
+    SYSVENV_ROOT.mkdir(parents=True, exist_ok=True)
     HISTORY_PATH.mkdir(exist_ok=True)
     SNAPSHOTS_PATH.mkdir(exist_ok=True)
 
@@ -235,7 +235,7 @@ def cmd_status(args):
 
     if not venv_exists():
         error("User venv not initialized")
-        print(f"\nRun: pyctl init")
+        print(f"\nRun: sysvenv init")
         return 1
 
     success(f"Venv exists: {VENV_PATH}")

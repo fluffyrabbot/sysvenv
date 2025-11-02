@@ -229,7 +229,7 @@ chmod -R 755 /opt/system-python
 **User setup (on first login or manual install):**
 ```bash
 # User runs: curl -sSL install.sh | sh
-# OR: pyctl init
+# OR: sysvenv init
 
 # 1. Create user venv
 python3 -m venv ~/.local/python-packages/venv
@@ -318,7 +318,7 @@ pip install requests black pytest
 
 **Viewing history:**
 ```bash
-pyctl history
+sysvenv history
 # Output:
 # #42  2025-11-01 10:30  pip install requests black pytest
 # #41  2025-10-30 14:22  pip install numpy pandas
@@ -327,41 +327,41 @@ pyctl history
 
 **Seeing what changed:**
 ```bash
-pyctl diff
+sysvenv diff
 # Shows last operation's diff
 
-pyctl diff 41
+sysvenv diff 41
 # Shows what operation #41 changed
 ```
 
 **Undoing mistakes:**
 ```bash
-pyctl undo
+sysvenv undo
 # Rolls back operation #42
 
-pyctl undo 3
+sysvenv undo 3
 # Rolls back last 3 operations
 ```
 
 **Nuclear option (start fresh):**
 ```bash
-pyctl clean
+sysvenv clean
 # Deletes ~/.local/python-packages/venv
 # Recreates from scratch
-# Optionally: pyctl clean --keep-baseline (restore to baseline snapshot)
+# Optionally: sysvenv clean --keep-baseline (restore to baseline snapshot)
 ```
 
 **Snapshots for different workflows:**
 ```bash
 # Save current state
-pyctl snapshot ml-stack
+sysvenv snapshot ml-stack
 
 # Later... switch to web dev packages
-pyctl clean
-pyctl restore webdev
+sysvenv clean
+sysvenv restore webdev
 
 # Back to ML work
-pyctl restore ml-stack
+sysvenv restore ml-stack
 ```
 
 ---
@@ -384,7 +384,7 @@ else
 
     # Take snapshot before write operations
     if [[ "$1" =~ ^(install|uninstall|upgrade)$ ]]; then
-        pyctl _snapshot-before "$@"
+        sysvenv _snapshot-before "$@"
     fi
 fi
 
@@ -394,27 +394,27 @@ EXITCODE=$?
 
 # Record changes after write operations
 if [ "$EUID" -ne 0 ] && [[ "$1" =~ ^(install|uninstall|upgrade)$ ]]; then
-    pyctl _snapshot-after "$@"
+    sysvenv _snapshot-after "$@"
 fi
 
 exit $EXITCODE
 ```
 
-#### 2. `pyctl` Management CLI
+#### 2. `sysvenv` Management CLI
 
 **Commands:**
 ```bash
-pyctl init                      # Initialize user venv
-pyctl status                    # Show current state
-pyctl history [--limit N]       # List operations
-pyctl diff [N]                  # Show changes from operation N (default: last)
-pyctl undo [N]                  # Rollback last N operations (default: 1)
-pyctl clean [--keep-baseline]   # Nuke and recreate venv
-pyctl snapshot <name>           # Save named snapshot
-pyctl restore <name>            # Restore named snapshot
-pyctl list-snapshots            # List available snapshots
-pyctl doctor                    # Health check and repair
-pyctl config <key> <value>      # Configure behavior
+sysvenv init                      # Initialize user venv
+sysvenv status                    # Show current state
+sysvenv history [--limit N]       # List operations
+sysvenv diff [N]                  # Show changes from operation N (default: last)
+sysvenv undo [N]                  # Rollback last N operations (default: 1)
+sysvenv clean [--keep-baseline]   # Nuke and recreate venv
+sysvenv snapshot <name>           # Save named snapshot
+sysvenv restore <name>            # Restore named snapshot
+sysvenv list-snapshots            # List available snapshots
+sysvenv doctor                    # Health check and repair
+sysvenv config <key> <value>      # Configure behavior
 ```
 
 **Implementation:** Single Python script (~400-600 LOC)
@@ -428,8 +428,8 @@ export PATH="$HOME/.local/python-packages/venv/bin:$PATH"
 export PYTHONUSERBASE="$HOME/.local/python-packages"
 
 # Optional: alias for quick access
-alias pyclean='pyctl clean'
-alias pyundo='pyctl undo'
+alias pyclean='sysvenv clean'
+alias pyundo='sysvenv undo'
 ```
 
 ---
@@ -518,13 +518,13 @@ verbose = false
 
 **Creating:**
 ```bash
-pyctl snapshot ml-stack
+sysvenv snapshot ml-stack
 # Saves current `pip freeze` to snapshots/ml-stack.txt
 ```
 
 **Restoring:**
 ```bash
-pyctl restore ml-stack
+sysvenv restore ml-stack
 # Nukes venv, recreates, installs from snapshots/ml-stack.txt
 ```
 
@@ -578,27 +578,27 @@ pip install httpie
 ## Implementation Roadmap
 
 ### Phase 1: Core Functionality (MVP)
-- [ ] `pyctl init` - Initialize user venv
+- [ ] `sysvenv init` - Initialize user venv
 - [ ] `pip` wrapper - Route to correct venv
 - [ ] Basic history recording (before/after snapshots)
-- [ ] `pyctl history` - View operations
-- [ ] `pyctl diff` - View changes
-- [ ] `pyctl undo` - Rollback operations
+- [ ] `sysvenv history` - View operations
+- [ ] `sysvenv diff` - View changes
+- [ ] `sysvenv undo` - Rollback operations
 - [ ] Shell integration installer
 
 ### Phase 2: Quality of Life
-- [ ] `pyctl clean` - Nuke and rebuild
+- [ ] `sysvenv clean` - Nuke and rebuild
 - [ ] Named snapshots (save/restore)
 - [ ] Baseline snapshot on init
 - [ ] Config file support
 - [ ] Pretty diff output with colors
-- [ ] `pyctl doctor` - Health check
+- [ ] `sysvenv doctor` - Health check
 
 ### Phase 3: Advanced Features
 - [ ] Wheel caching for faster undo
-- [ ] `pyctl search <pkg>` - Search for packages
-- [ ] `pyctl info <pkg>` - Show package info
-- [ ] `pyctl export` - Export history as requirements.txt
+- [ ] `sysvenv search <pkg>` - Search for packages
+- [ ] `sysvenv info <pkg>` - Show package info
+- [ ] `sysvenv export` - Export history as requirements.txt
 - [ ] Integration with system package manager (detect conflicts)
 
 ### Phase 4: Distribution
@@ -613,7 +613,7 @@ pip install httpie
 
 ## Technical Decisions
 
-### Why Python for `pyctl`?
+### Why Python for `sysvenv`?
 
 - Users already have Python installed
 - Easy to parse JSON, run pip freeze, manipulate venvs
@@ -624,7 +624,7 @@ pip install httpie
 
 - Fast (no Python startup time)
 - Simple routing logic
-- Just calls `pyctl` for heavy lifting
+- Just calls `sysvenv` for heavy lifting
 
 ### Why JSON for history?
 
@@ -651,7 +651,7 @@ pip install httpie
 
 ### What if user has existing `~/.local/`?
 
-- Check on `pyctl init`, warn if conflicts detected
+- Check on `sysvenv init`, warn if conflicts detected
 - Offer to migrate existing `~/.local/bin` entries
 
 ### What if user activates a project venv?
@@ -726,10 +726,10 @@ A: Political/governance issues. Easier to ship as a distro default.
 A: No. If you activate a project venv, it takes precedence. This is just a better fallback.
 
 **Q: Can I disable the auto-snapshots?**
-A: Yes. `pyctl config auto_snapshot false`
+A: Yes. `sysvenv config auto_snapshot false`
 
 **Q: How do I migrate my existing packages?**
-A: `pip freeze > old.txt && pyctl init && pip install -r old.txt`
+A: `pip freeze > old.txt && sysvenv init && pip install -r old.txt`
 
 ---
 
