@@ -7,11 +7,13 @@ history tracking, and easy undo/rollback capabilities.
 """
 
 import argparse
+import fcntl
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -28,6 +30,11 @@ VENV_PATH = SYSVENV_ROOT / "venv"
 HISTORY_PATH = SYSVENV_ROOT / "history"
 SNAPSHOTS_PATH = SYSVENV_ROOT / "snapshots"
 CONFIG_PATH = SYSVENV_ROOT / "config.toml"
+LOCK_FILE = SYSVENV_ROOT / ".sysvenv.lock"
+
+# Reserved snapshot names that cannot be used
+RESERVED_SNAPSHOT_NAMES = {'baseline'}
+MAX_SNAPSHOT_NAME_LENGTH = 64
 
 DEFAULT_CONFIG = """[history]
 max_entries = 100
@@ -140,19 +147,33 @@ def pip_freeze() -> str:
 
 
 def get_history_id() -> int:
-    """Get next history entry ID"""
-    if not HISTORY_PATH.exists():
-        return 1
+    """Get next history entry ID with file locking to prevent race conditions"""
+    ensure_dirs()
 
-    max_id = 0
-    for file in HISTORY_PATH.glob("*_before.json"):
+    # Use file locking to prevent concurrent access
+    lock_file = LOCK_FILE
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(lock_file, 'w') as lock_fd:
         try:
-            id_str = file.stem.split("_")[0]
-            max_id = max(max_id, int(id_str))
-        except (ValueError, IndexError):
-            continue
+            # Acquire exclusive lock (blocks if another process has it)
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
 
-    return max_id + 1
+            if not HISTORY_PATH.exists():
+                return 1
+
+            max_id = 0
+            for file in HISTORY_PATH.glob("*_before.json"):
+                try:
+                    id_str = file.stem.split("_")[0]
+                    max_id = max(max_id, int(id_str))
+                except (ValueError, IndexError):
+                    continue
+
+            return max_id + 1
+        finally:
+            # Release lock
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
 
 
 def venv_exists() -> bool:
@@ -217,7 +238,24 @@ def check_disk_space(path: Path, required_mb: int = 100) -> bool:
 def validate_snapshot_name(name: str) -> bool:
     """Validate snapshot name (alphanumeric, dash, underscore only)"""
     import re
-    return bool(re.match(r'^[a-zA-Z0-9_-]+$', name))
+
+    # Check basic pattern
+    if not re.match(r'^[a-zA-Z0-9_-]+$', name):
+        return False
+
+    # Check length
+    if len(name) > MAX_SNAPSHOT_NAME_LENGTH:
+        return False
+
+    # Check for reserved names
+    if name.lower() in RESERVED_SNAPSHOT_NAMES:
+        return False
+
+    # Reject names starting with dash or dot (shell safety)
+    if name.startswith('-') or name.startswith('.'):
+        return False
+
+    return True
 
 
 def confirm_action(message: str, default: bool = False) -> bool:
@@ -251,6 +289,64 @@ def safe_read_json(file_path: Path) -> Optional[Dict]:
         return None
 
 
+def atomic_write_json(file_path: Path, data: Dict):
+    """Atomically write JSON file to prevent corruption"""
+    # Write to temporary file first
+    tmp_path = file_path.parent / f".{file_path.name}.tmp"
+    try:
+        with open(tmp_path, 'w') as f:
+            json.dump(data, f, indent=2)
+        # Atomic replace (POSIX guarantees atomicity)
+        os.replace(tmp_path, file_path)
+    except Exception:
+        # Clean up temp file on error
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
+
+
+def atomic_write_text(file_path: Path, content: str):
+    """Atomically write text file to prevent corruption"""
+    tmp_path = file_path.parent / f".{file_path.name}.tmp"
+    try:
+        tmp_path.write_text(content)
+        # Atomic replace
+        os.replace(tmp_path, file_path)
+    except Exception:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
+
+
+def safe_rmtree(path: Path, check_symlink: bool = True):
+    """Safely remove directory tree with symlink protection"""
+    if not path.exists():
+        return
+
+    # Check if it's a symlink
+    if check_symlink and path.is_symlink():
+        error(f"Refusing to remove symlink: {path}")
+        error("This could be a security attack. Please remove manually.")
+        raise ValueError(f"Path is a symlink: {path}")
+
+    # Verify path is within expected boundaries
+    try:
+        real_path = path.resolve()
+        expected_parent = SYSVENV_ROOT.resolve()
+
+        if not str(real_path).startswith(str(expected_parent)):
+            error(f"Path {path} resolves outside sysvenv directory")
+            error(f"Real path: {real_path}")
+            error(f"Expected under: {expected_parent}")
+            raise ValueError("Path traversal detected")
+    except Exception as e:
+        error(f"Path validation failed: {e}")
+        raise
+
+    # Safe to remove
+    shutil.rmtree(path)
+
+
 # ============================================================================
 # Commands
 # ============================================================================
@@ -265,7 +361,7 @@ def cmd_init(args):
         if not confirm_action("Reinitialize (this will delete existing venv)?"):
             return 0
         info("Removing existing venv...")
-        shutil.rmtree(VENV_PATH)
+        safe_rmtree(VENV_PATH)
 
     # Check disk space
     if not check_disk_space(SYSVENV_ROOT, 500):
@@ -289,13 +385,8 @@ def cmd_init(args):
         # Create baseline snapshot
         baseline_file = SNAPSHOTS_PATH / "baseline.txt"
         freeze = pip_freeze()
-        baseline_file.write_text(freeze)
+        atomic_write_text(baseline_file, freeze)
         success("Created baseline snapshot")
-
-        # Create default config if it doesn't exist
-        if not CONFIG_PATH.exists():
-            CONFIG_PATH.write_text(DEFAULT_CONFIG)
-            success("Created default config")
 
         heading("Setup complete!")
         print("\nNext steps:")
@@ -310,7 +401,7 @@ def cmd_init(args):
         error(f"Initialization failed: {e}")
         error("Rolling back...")
         if VENV_PATH.exists():
-            shutil.rmtree(VENV_PATH)
+            safe_rmtree(VENV_PATH)
         return 1
 
 
@@ -408,12 +499,6 @@ def cmd_doctor(args):
     else:
         warning("Venv not in PATH (add to shell config)")
 
-    # Check config
-    if CONFIG_PATH.exists():
-        success("Config file exists")
-    else:
-        issues.append("Config file missing")
-
     # Summary
     if issues:
         heading(f"\nFound {len(issues)} issue(s):")
@@ -427,10 +512,6 @@ def cmd_doctor(args):
             if not venv_exists():
                 info("Creating venv...")
                 return cmd_init(args)
-
-            if not CONFIG_PATH.exists():
-                CONFIG_PATH.write_text(DEFAULT_CONFIG)
-                success("Created config file")
 
             success("Repairs complete")
             return 0
@@ -618,7 +699,7 @@ def cmd_undo(args):
     try:
         # Nuke and recreate venv
         info("Removing current venv...")
-        shutil.rmtree(VENV_PATH)
+        safe_rmtree(VENV_PATH)
 
         info("Creating fresh venv...")
         venv.create(VENV_PATH, with_pip=True, symlinks=True)
@@ -688,7 +769,7 @@ def cmd_clean(args):
     try:
         # Nuke venv
         info("Removing venv...")
-        shutil.rmtree(VENV_PATH)
+        safe_rmtree(VENV_PATH)
 
         # Recreate
         info("Creating fresh venv...")
@@ -733,7 +814,11 @@ def cmd_snapshot(args):
     # Validate snapshot name
     if not validate_snapshot_name(name):
         error(f"Invalid snapshot name: '{name}'")
-        error("Use only alphanumeric characters, dashes, and underscores")
+        error("Requirements:")
+        error(f"  • Alphanumeric, dashes, and underscores only")
+        error(f"  • Maximum {MAX_SNAPSHOT_NAME_LENGTH} characters")
+        error(f"  • Cannot use reserved names: {', '.join(RESERVED_SNAPSHOT_NAMES)}")
+        error(f"  • Cannot start with '-' or '.'")
         return 1
 
     snapshot_file = SNAPSHOTS_PATH / f"{name}.txt"
@@ -745,7 +830,7 @@ def cmd_snapshot(args):
 
     try:
         freeze = pip_freeze()
-        snapshot_file.write_text(freeze)
+        atomic_write_text(snapshot_file, freeze)
 
         # Count packages
         pkg_count = len([l for l in freeze.split('\n') if l.strip() and not l.startswith('#')])
@@ -799,7 +884,7 @@ def cmd_restore(args):
     try:
         # Nuke and recreate venv
         info("Removing current venv...")
-        shutil.rmtree(VENV_PATH)
+        safe_rmtree(VENV_PATH)
 
         info("Creating fresh venv...")
         venv.create(VENV_PATH, with_pip=True, symlinks=True)
@@ -875,8 +960,7 @@ def cmd_snapshot_before(args):
     }
 
     before_file = HISTORY_PATH / f"{entry_id:03d}_before.json"
-    with open(before_file, 'w') as f:
-        json.dump(entry, f, indent=2)
+    atomic_write_json(before_file, entry)
 
     return 0
 
@@ -909,8 +993,7 @@ def cmd_snapshot_after(args):
     after_entry["exit_code"] = 0
 
     after_file = HISTORY_PATH / f"{entry_id:03d}_after.json"
-    with open(after_file, 'w') as f:
-        json.dump(after_entry, f, indent=2)
+    atomic_write_json(after_file, after_entry)
 
     # Show diff
     if added or removed or modified:
