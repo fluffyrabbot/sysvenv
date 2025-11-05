@@ -347,6 +347,79 @@ def safe_rmtree(path: Path, check_symlink: bool = True):
     shutil.rmtree(path)
 
 
+def check_system_packages(package_names: List[str]) -> List[Tuple[str, str]]:
+    """Check if packages are installed via system package manager
+
+    Returns list of (package_name, system_package_name) tuples for conflicts
+    """
+    conflicts = []
+
+    # Check for dpkg/apt (Debian/Ubuntu)
+    if shutil.which('dpkg'):
+        for pkg in package_names:
+            # System packages are typically named python3-<package>
+            system_pkg = f"python3-{pkg.lower()}"
+            try:
+                result = subprocess.run(
+                    ['dpkg', '-l', system_pkg],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                # dpkg -l returns 0 if package is installed
+                if result.returncode == 0 and 'ii' in result.stdout:
+                    conflicts.append((pkg, system_pkg))
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                pass
+
+    # Check for rpm (RHEL/Fedora/CentOS)
+    elif shutil.which('rpm'):
+        for pkg in package_names:
+            system_pkg = f"python3-{pkg.lower()}"
+            try:
+                result = subprocess.run(
+                    ['rpm', '-q', system_pkg],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0:
+                    conflicts.append((pkg, system_pkg))
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                pass
+
+    return conflicts
+
+
+def extract_package_names(pip_args: List[str]) -> List[str]:
+    """Extract package names from pip command arguments"""
+    packages = []
+    skip_next = False
+
+    for arg in pip_args:
+        if skip_next:
+            skip_next = False
+            continue
+
+        # Skip flags
+        if arg.startswith('-'):
+            # Some flags take values
+            if arg in ['-r', '--requirement', '-c', '--constraint', '-e', '--editable']:
+                skip_next = True
+            continue
+
+        # Skip subcommands
+        if arg in ['install', 'uninstall', 'upgrade']:
+            continue
+
+        # Extract package name (handle package==version, package>=version, etc.)
+        pkg_name = arg.split('==')[0].split('>=')[0].split('<=')[0].split('!=')[0].split('~=')[0].split('[')[0]
+        if pkg_name and not pkg_name.startswith('git+') and not pkg_name.startswith('http'):
+            packages.append(pkg_name)
+
+    return packages
+
+
 # ============================================================================
 # Commands
 # ============================================================================
@@ -939,6 +1012,175 @@ def cmd_list_snapshots(args):
     return 0
 
 
+def cmd_share(args):
+    """Export snapshot for sharing with teammates"""
+    name = args.name if args.name else "shared-env"
+
+    if not venv_exists():
+        error("User venv not initialized")
+        return 1
+
+    # Validate snapshot name if provided
+    if args.name and not validate_snapshot_name(name):
+        error(f"Invalid snapshot name: '{name}'")
+        return 1
+
+    try:
+        # Get current Python version
+        python_bin = VENV_PATH / "bin" / "python3"
+        result = run_command([str(python_bin), "--version"])
+        python_version = result.stdout.strip()
+
+        # Get pip freeze
+        freeze = pip_freeze()
+        pkg_count = len([l for l in freeze.split('\n') if l.strip() and not l.startswith('#')])
+
+        # Create metadata
+        metadata = {
+            "created_at": datetime.utcnow().isoformat() + "Z",
+            "created_by": os.getenv("USER", "unknown"),
+            "python_version": python_version,
+            "package_count": pkg_count,
+            "hostname": os.getenv("HOSTNAME", "unknown")
+        }
+
+        # Create shareable file
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        share_filename = f"{name}-{timestamp}.sysvenv"
+        share_path = Path.cwd() / share_filename
+
+        # Write metadata and packages
+        with open(share_path, 'w') as f:
+            f.write("# sysvenv shared environment\n")
+            f.write(f"# Created: {metadata['created_at']}\n")
+            f.write(f"# Python: {metadata['python_version']}\n")
+            f.write(f"# Packages: {metadata['package_count']}\n")
+            f.write(f"# By: {metadata['created_by']}@{metadata['hostname']}\n")
+            f.write("#\n")
+            f.write("# To import: sysvenv import " + share_filename + "\n")
+            f.write("\n")
+            f.write(freeze)
+
+        success(f"Created shareable environment: {share_filename}")
+        print(f"\nEnvironment details:")
+        print(f"  Python: {python_version}")
+        print(f"  Packages: {pkg_count}")
+        print(f"\nShare this file with teammates:")
+        cprint(f"  {share_path}", Colors.CYAN)
+        print(f"\nThey can import it with:")
+        cprint(f"  sysvenv import {share_filename}", Colors.CYAN)
+
+        return 0
+
+    except Exception as e:
+        error(f"Failed to create shareable environment: {e}")
+        return 1
+
+
+def cmd_import(args):
+    """Import a shared environment snapshot"""
+    share_file = Path(args.file)
+
+    if not share_file.exists():
+        error(f"File not found: {share_file}")
+        return 1
+
+    if not venv_exists():
+        error("User venv not initialized. Run: sysvenv init")
+        return 1
+
+    try:
+        # Read the file
+        content = share_file.read_text()
+
+        # Extract metadata from comments
+        metadata = {}
+        freeze_lines = []
+        for line in content.split('\n'):
+            if line.startswith('# Python:'):
+                metadata['python'] = line.split(':', 1)[1].strip()
+            elif line.startswith('# Packages:'):
+                metadata['packages'] = line.split(':', 1)[1].strip()
+            elif line.startswith('# By:'):
+                metadata['created_by'] = line.split(':', 1)[1].strip()
+            elif not line.startswith('#'):
+                freeze_lines.append(line)
+
+        freeze = '\n'.join(freeze_lines).strip()
+        pkg_count = len([l for l in freeze.split('\n') if l.strip()])
+
+        heading("Importing shared environment")
+        print(f"  From: {metadata.get('created_by', 'unknown')}")
+        print(f"  Python: {metadata.get('python', 'unknown')}")
+        print(f"  Packages: {pkg_count}")
+
+        # Check Python version compatibility
+        python_bin = VENV_PATH / "bin" / "python3"
+        result = run_command([str(python_bin), "--version"])
+        current_python = result.stdout.strip()
+
+        if metadata.get('python') and metadata['python'] != current_python:
+            warning(f"Python version mismatch!")
+            print(f"  Shared environment: {metadata['python']}")
+            print(f"  Your environment: {current_python}")
+            if not confirm_action("Continue anyway?"):
+                info("Cancelled")
+                return 0
+
+        if args.dry_run:
+            warning("DRY RUN - no changes will be made")
+            print("\nWould restore packages:")
+            for line in freeze.split('\n')[:10]:
+                if line.strip():
+                    print(f"  {line}")
+            if pkg_count > 10:
+                print(f"  ... and {pkg_count - 10} more")
+            return 0
+
+        # Confirm restoration
+        if not confirm_action(f"This will replace your current venv with {pkg_count} packages. Continue?"):
+            info("Cancelled")
+            return 0
+
+        # Check disk space
+        if not check_disk_space(SYSVENV_ROOT, 500):
+            error("Low disk space (need at least 500MB)")
+            return 1
+
+        # Nuke and recreate venv
+        info("Removing current venv...")
+        safe_rmtree(VENV_PATH)
+
+        info("Creating fresh venv...")
+        venv.create(VENV_PATH, with_pip=True, symlinks=True)
+
+        # Upgrade pip
+        pip_bin = VENV_PATH / "bin" / "pip"
+        run_command([str(pip_bin), "install", "--upgrade", "pip", "-q"])
+
+        # Restore packages
+        if freeze:
+            info(f"Installing {pkg_count} packages...")
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                f.write(freeze)
+                temp_file = f.name
+
+            try:
+                run_command([str(pip_bin), "install", "-r", temp_file], capture=False)
+            finally:
+                os.unlink(temp_file)
+
+        success("Imported shared environment successfully")
+
+        return 0
+
+    except Exception as e:
+        error(f"Import failed: {e}")
+        error("Your venv may be in an inconsistent state. Run 'sysvenv doctor --fix' to repair.")
+        return 1
+
+
 # ============================================================================
 # Internal commands (used by pip wrapper)
 # ============================================================================
@@ -1013,6 +1255,31 @@ def cmd_snapshot_after(args):
     return 0
 
 
+def cmd_check_conflicts(args):
+    """Internal: Check for system package conflicts before pip install"""
+    # Extract package names from pip command
+    packages = extract_package_names(args.command)
+
+    if not packages:
+        return 0
+
+    # Check for system package conflicts
+    conflicts = check_system_packages(packages)
+
+    if conflicts:
+        warning("System package conflicts detected:")
+        for pkg, sys_pkg in conflicts:
+            print(f"  • {pkg}: system has {sys_pkg} installed")
+
+        print("\n💡 Recommendations:")
+        print("  1. Use system package manager (apt/yum) for system-wide installs")
+        print("  2. Continue with pip (may cause conflicts)")
+        print("  3. Create isolated project venv (recommended for projects)")
+        print()
+
+    return 0
+
+
 # ============================================================================
 # CLI Setup
 # ============================================================================
@@ -1080,6 +1347,17 @@ def main():
     parser_list = subparsers.add_parser('list-snapshots', help='List available snapshots')
     parser_list.set_defaults(func=cmd_list_snapshots)
 
+    # share
+    parser_share = subparsers.add_parser('share', help='Export environment for sharing')
+    parser_share.add_argument('name', nargs='?', help='Name for shared environment (optional)')
+    parser_share.set_defaults(func=cmd_share)
+
+    # import
+    parser_import = subparsers.add_parser('import', help='Import shared environment')
+    parser_import.add_argument('file', help='Path to .sysvenv file')
+    parser_import.add_argument('--dry-run', action='store_true', help='Show what would be done')
+    parser_import.set_defaults(func=cmd_import)
+
     # Internal commands (used by pip wrapper)
     parser_sb = subparsers.add_parser('_snapshot-before', help=argparse.SUPPRESS)
     parser_sb.add_argument('command', nargs='+')
@@ -1088,6 +1366,10 @@ def main():
     parser_sa = subparsers.add_parser('_snapshot-after', help=argparse.SUPPRESS)
     parser_sa.add_argument('command', nargs='+')
     parser_sa.set_defaults(func=cmd_snapshot_after)
+
+    parser_cc = subparsers.add_parser('_check-conflicts', help=argparse.SUPPRESS)
+    parser_cc.add_argument('command', nargs='+')
+    parser_cc.set_defaults(func=cmd_check_conflicts)
 
     # Parse and run
     args = parser.parse_args()
