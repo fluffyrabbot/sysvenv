@@ -30,8 +30,52 @@ if [ -n "$VIRTUAL_ENV" ]; then
 elif [ "$EUID" -eq 0 ]; then
     TARGET_VENV="$SYSTEM_VENV"
     USE_WRAPPER=false
-# Regular user - use user venv
+# Regular user - check for project markers and offer project venv
 else
+    # Check if we're in a project directory with markers
+    PROJECT_MARKERS=(
+        "requirements.txt"
+        "pyproject.toml"
+        "setup.py"
+        "poetry.lock"
+        "Pipfile"
+    )
+
+    HAS_PROJECT_MARKER=false
+    for marker in "${PROJECT_MARKERS[@]}"; do
+        if [ -f "$marker" ]; then
+            HAS_PROJECT_MARKER=true
+            break
+        fi
+    done
+
+    # Check if local venv exists
+    if [ -d "./venv" ] || [ -d "./.venv" ]; then
+        # Use local venv if it exists
+        if [ -d "./venv" ]; then
+            LOCAL_VENV="./venv"
+        else
+            LOCAL_VENV="./.venv"
+        fi
+
+        # Warn if not activated
+        if [ -z "$VIRTUAL_ENV" ]; then
+            echo "⚠️  Project venv detected but not activated: $LOCAL_VENV" >&2
+            echo "   Activate with: source $LOCAL_VENV/bin/activate" >&2
+            echo "   Or: pip will install to user venv instead" >&2
+            echo "" >&2
+        fi
+    # Suggest creating project venv if markers found and this is an install operation
+    elif [ "$HAS_PROJECT_MARKER" = true ] && [ "${1:-}" = "install" ]; then
+        echo "💡 Project markers detected (requirements.txt, pyproject.toml, etc.)" >&2
+        echo "   Consider creating a project venv for isolation:" >&2
+        echo "   → python3 -m venv venv && source venv/bin/activate" >&2
+        echo "   → Then run your pip install command" >&2
+        echo "" >&2
+        echo "   Continuing with user venv..." >&2
+        echo "" >&2
+    fi
+
     TARGET_VENV="$USER_VENV"
     USE_WRAPPER=true
 fi
@@ -64,10 +108,16 @@ if [ "$USE_WRAPPER" = true ] && [[ "$FIRST_ARG" =~ ^($SNAPSHOT_OPERATIONS)$ ]]; 
     SHOULD_SNAPSHOT=true
 fi
 
-# Take before snapshot
+# Take before snapshot and check for conflicts/downgrades
 if [ "$SHOULD_SNAPSHOT" = true ]; then
     # Check if sysvenv exists
     if command -v sysvenv >/dev/null 2>&1; then
+        # Check for system package conflicts and downgrades on install operations
+        if [ "$FIRST_ARG" = "install" ]; then
+            sysvenv _check-conflicts "$@" 2>/dev/null || true
+            sysvenv _check-downgrades "$@" 2>/dev/null || true
+        fi
+
         sysvenv _snapshot-before "$@" 2>/dev/null || true
     fi
 fi
@@ -80,12 +130,17 @@ fi
 EXIT_CODE=$?
 
 # ============================================================================
-# Take after snapshot
+# Take after snapshot and check for orphans
 # ============================================================================
 
 if [ "$SHOULD_SNAPSHOT" = true ] && [ $EXIT_CODE -eq 0 ]; then
     if command -v sysvenv >/dev/null 2>&1; then
         sysvenv _snapshot-after "$@" 2>/dev/null || true
+
+        # Check for orphaned packages after uninstall
+        if [ "$FIRST_ARG" = "uninstall" ]; then
+            sysvenv _check-orphans "$@" 2>/dev/null || true
+        fi
     fi
 fi
 

@@ -16,7 +16,7 @@ import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 import venv
 
 
@@ -347,6 +347,280 @@ def safe_rmtree(path: Path, check_symlink: bool = True):
     shutil.rmtree(path)
 
 
+def check_system_packages(package_names: List[str]) -> List[Tuple[str, str]]:
+    """Check if packages are installed via system package manager
+
+    Returns list of (package_name, system_package_name) tuples for conflicts
+    """
+    conflicts = []
+
+    # Check for dpkg/apt (Debian/Ubuntu)
+    if shutil.which('dpkg'):
+        for pkg in package_names:
+            # System packages are typically named python3-<package>
+            system_pkg = f"python3-{pkg.lower()}"
+            try:
+                result = subprocess.run(
+                    ['dpkg', '-l', system_pkg],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                # dpkg -l returns 0 if package is installed
+                if result.returncode == 0 and 'ii' in result.stdout:
+                    conflicts.append((pkg, system_pkg))
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                pass
+
+    # Check for rpm (RHEL/Fedora/CentOS)
+    elif shutil.which('rpm'):
+        for pkg in package_names:
+            system_pkg = f"python3-{pkg.lower()}"
+            try:
+                result = subprocess.run(
+                    ['rpm', '-q', system_pkg],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0:
+                    conflicts.append((pkg, system_pkg))
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                pass
+
+    return conflicts
+
+
+def extract_package_names(pip_args: List[str]) -> List[str]:
+    """Extract package names from pip command arguments"""
+    packages = []
+    skip_next = False
+
+    for arg in pip_args:
+        if skip_next:
+            skip_next = False
+            continue
+
+        # Skip flags
+        if arg.startswith('-'):
+            # Some flags take values
+            if arg in ['-r', '--requirement', '-c', '--constraint', '-e', '--editable']:
+                skip_next = True
+            continue
+
+        # Skip subcommands
+        if arg in ['install', 'uninstall', 'upgrade']:
+            continue
+
+        # Extract package name (handle package==version, package>=version, etc.)
+        pkg_name = arg.split('==')[0].split('>=')[0].split('<=')[0].split('!=')[0].split('~=')[0].split('[')[0]
+        if pkg_name and not pkg_name.startswith('git+') and not pkg_name.startswith('http'):
+            packages.append(pkg_name)
+
+    return packages
+
+
+def get_package_provenance(package_name: str) -> Optional[Dict]:
+    """Get package installation source and metadata"""
+    if not venv_exists():
+        return None
+
+    pip_bin = VENV_PATH / "bin" / "pip"
+    try:
+        result = run_command([str(pip_bin), "show", package_name], check=False)
+        if result.returncode != 0:
+            return None
+
+        provenance = {
+            "name": package_name,
+            "source": "pypi",  # default assumption
+            "metadata": {}
+        }
+
+        # Parse pip show output
+        for line in result.stdout.split('\n'):
+            if ':' in line:
+                key, value = line.split(':', 1)
+                key = key.strip()
+                value = value.strip()
+
+                if key == "Version":
+                    provenance["metadata"]["version"] = value
+                elif key == "Location":
+                    location = value
+                    provenance["metadata"]["location"] = location
+
+                    # Detect source from location
+                    if "site-packages" in location:
+                        if ".egg-link" in location or "-e" in location:
+                            provenance["source"] = "editable"
+                        else:
+                            provenance["source"] = "pypi"
+                    elif "src" in location.lower():
+                        provenance["source"] = "git"
+                elif key == "Installer":
+                    provenance["metadata"]["installer"] = value
+
+        return provenance
+
+    except Exception:
+        return None
+
+
+def track_installation_provenance(pip_args: List[str]) -> Dict[str, Dict]:
+    """Track provenance for packages being installed"""
+    provenance_map = {}
+
+    # Detect installation source from command args
+    for i, arg in enumerate(pip_args):
+        if arg.startswith('git+'):
+            # Git installation
+            pkg_url = arg.split('git+')[1]
+            pkg_name = pkg_url.split('/')[-1].split('.git')[0]
+            provenance_map[pkg_name] = {
+                "source": "git",
+                "url": pkg_url,
+                "command_arg": arg
+            }
+        elif arg.startswith('http://') or arg.startswith('https://'):
+            # URL installation
+            pkg_name = arg.split('/')[-1].split('-')[0]
+            provenance_map[pkg_name] = {
+                "source": "url",
+                "url": arg
+            }
+        elif arg == '-e' and i + 1 < len(pip_args):
+            # Editable install
+            path = pip_args[i + 1]
+            pkg_name = Path(path).name
+            provenance_map[pkg_name] = {
+                "source": "editable",
+                "path": path
+            }
+        elif arg.startswith('-e'):
+            # -e inline
+            path = arg[2:]
+            pkg_name = Path(path).name
+            provenance_map[pkg_name] = {
+                "source": "editable",
+                "path": path
+            }
+
+    return provenance_map
+
+
+def suggest_snapshot_if_stable(pkg_count: int, history_count: int, named_snapshot_count: int) -> bool:
+    """Heuristic to suggest creating a snapshot
+
+    Returns True if environment appears stable and worth snapshotting
+    """
+    # Don't suggest if already have named snapshots
+    if named_snapshot_count > 0:
+        return False
+
+    # Don't suggest for minimal environments
+    if pkg_count < 15:
+        return False
+
+    # Don't suggest too early (let user build up environment first)
+    if history_count < 3:
+        return False
+
+    # Check if recent activity suggests stability
+    # If we have 15+ packages and 3+ operations but no named snapshots,
+    # suggest saving the work
+    if pkg_count >= 15 and history_count >= 3:
+        return True
+
+    # For larger environments, always suggest if no named snapshots
+    if pkg_count >= 30:
+        return True
+
+    return False
+
+
+def build_dependency_graph() -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]]]:
+    """Build dependency graph for installed packages
+
+    Returns:
+        (requires_map, required_by_map)
+        requires_map: {package: set(packages it depends on)}
+        required_by_map: {package: set(packages that depend on it)}
+    """
+    if not venv_exists():
+        return {}, {}
+
+    pip_bin = VENV_PATH / "bin" / "pip"
+
+    requires_map = {}
+    required_by_map = {}
+
+    # Get list of installed packages
+    freeze = pip_freeze()
+    packages = [line.split('==')[0] for line in freeze.split('\n') if line.strip() and '==' in line]
+
+    for pkg in packages:
+        try:
+            result = run_command([str(pip_bin), "show", pkg], check=False)
+            if result.returncode != 0:
+                continue
+
+            requires = set()
+            for line in result.stdout.split('\n'):
+                if line.startswith('Requires:'):
+                    deps = line.split(':', 1)[1].strip()
+                    if deps and deps != '':
+                        requires = set(d.strip() for d in deps.split(','))
+                    break
+
+            requires_map[pkg] = requires
+
+            # Build reverse map
+            for dep in requires:
+                if dep not in required_by_map:
+                    required_by_map[dep] = set()
+                required_by_map[dep].add(pkg)
+
+        except Exception:
+            continue
+
+    return requires_map, required_by_map
+
+
+def find_orphan_packages(removed_packages: List[str]) -> List[str]:
+    """Find packages that are only required by removed packages
+
+    Args:
+        removed_packages: List of package names that were removed
+
+    Returns:
+        List of orphaned package names
+    """
+    requires_map, required_by_map = build_dependency_graph()
+
+    removed_set = set(pkg.lower() for pkg in removed_packages)
+    orphans = []
+
+    # Get all installed packages
+    freeze = pip_freeze()
+    all_packages = {line.split('==')[0].lower() for line in freeze.split('\n') if line.strip() and '==' in line}
+
+    # For each installed package
+    for pkg in all_packages:
+        if pkg in removed_set:
+            continue  # Skip packages we're removing
+
+        # Get what requires this package
+        required_by = required_by_map.get(pkg, set())
+        required_by_lower = {r.lower() for r in required_by}
+
+        # If only required by removed packages (or nothing), it's an orphan
+        if required_by_lower and required_by_lower.issubset(removed_set):
+            orphans.append(pkg)
+
+    return orphans
+
+
 # ============================================================================
 # Commands
 # ============================================================================
@@ -437,6 +711,7 @@ def cmd_status(args):
 
     # Snapshots
     snapshots = list(SNAPSHOTS_PATH.glob("*.txt"))
+    named_snapshots = [s for s in snapshots if s.stem != "baseline"]
     print(f"Snapshots: {len(snapshots)}")
     if snapshots:
         print(f"  Available: {', '.join(s.stem for s in sorted(snapshots))}")
@@ -454,6 +729,15 @@ def cmd_status(args):
         error(f"  ✗ User venv not in PATH")
         print(f"\n  Add to ~/.bashrc:")
         cprint(f'  export PATH="{VENV_PATH}/bin:$PATH"', Colors.CYAN)
+
+    # Smart snapshot reminder
+    should_suggest = suggest_snapshot_if_stable(pkg_count, history_count, len(named_snapshots))
+    if should_suggest:
+        print()
+        info("💡 Snapshot Suggestion:")
+        print("  Your environment looks stable and well-developed!")
+        print(f"  Consider saving a snapshot for backup:")
+        cprint(f"  → sysvenv snapshot my-environment", Colors.CYAN)
 
     return 0
 
@@ -577,7 +861,15 @@ def cmd_history(args):
 
         summary = f" [{', '.join(change_summary)}]" if change_summary else ""
 
-        print(f"#{entry_id:3d}  {timestamp}  {command}{summary}")
+        # Show provenance info if detailed mode
+        provenance_info = ""
+        if args.detailed and entry.get("provenance"):
+            prov = entry.get("provenance", {})
+            sources = set(p.get("source", "pypi") for p in prov.values())
+            if sources and sources != {"pypi"}:
+                provenance_info = f" [{', '.join(sources)}]"
+
+        print(f"#{entry_id:3d}  {timestamp}  {command}{summary}{provenance_info}")
 
     if corrupted_count > 0:
         warning(f"\n{corrupted_count} corrupted history entries skipped")
@@ -616,10 +908,19 @@ def cmd_diff(args):
     removed = changes.get("removed", [])
     modified = changes.get("modified", [])
 
+    # Get provenance if available
+    provenance = entry.get("provenance", {})
+
     if added:
         print("\nAdded:")
         for pkg in added:
-            cprint(f"  + {pkg}", Colors.GREEN)
+            pkg_name = pkg.split('==')[0]
+            source_info = ""
+            if pkg_name in provenance:
+                source = provenance[pkg_name].get("source", "pypi")
+                if source != "pypi":
+                    source_info = f" [{source}]"
+            cprint(f"  + {pkg}{source_info}", Colors.GREEN)
 
     if removed:
         print("\nRemoved:")
@@ -939,6 +1240,175 @@ def cmd_list_snapshots(args):
     return 0
 
 
+def cmd_share(args):
+    """Export snapshot for sharing with teammates"""
+    name = args.name if args.name else "shared-env"
+
+    if not venv_exists():
+        error("User venv not initialized")
+        return 1
+
+    # Validate snapshot name if provided
+    if args.name and not validate_snapshot_name(name):
+        error(f"Invalid snapshot name: '{name}'")
+        return 1
+
+    try:
+        # Get current Python version
+        python_bin = VENV_PATH / "bin" / "python3"
+        result = run_command([str(python_bin), "--version"])
+        python_version = result.stdout.strip()
+
+        # Get pip freeze
+        freeze = pip_freeze()
+        pkg_count = len([l for l in freeze.split('\n') if l.strip() and not l.startswith('#')])
+
+        # Create metadata
+        metadata = {
+            "created_at": datetime.utcnow().isoformat() + "Z",
+            "created_by": os.getenv("USER", "unknown"),
+            "python_version": python_version,
+            "package_count": pkg_count,
+            "hostname": os.getenv("HOSTNAME", "unknown")
+        }
+
+        # Create shareable file
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        share_filename = f"{name}-{timestamp}.sysvenv"
+        share_path = Path.cwd() / share_filename
+
+        # Write metadata and packages
+        with open(share_path, 'w') as f:
+            f.write("# sysvenv shared environment\n")
+            f.write(f"# Created: {metadata['created_at']}\n")
+            f.write(f"# Python: {metadata['python_version']}\n")
+            f.write(f"# Packages: {metadata['package_count']}\n")
+            f.write(f"# By: {metadata['created_by']}@{metadata['hostname']}\n")
+            f.write("#\n")
+            f.write("# To import: sysvenv import " + share_filename + "\n")
+            f.write("\n")
+            f.write(freeze)
+
+        success(f"Created shareable environment: {share_filename}")
+        print(f"\nEnvironment details:")
+        print(f"  Python: {python_version}")
+        print(f"  Packages: {pkg_count}")
+        print(f"\nShare this file with teammates:")
+        cprint(f"  {share_path}", Colors.CYAN)
+        print(f"\nThey can import it with:")
+        cprint(f"  sysvenv import {share_filename}", Colors.CYAN)
+
+        return 0
+
+    except Exception as e:
+        error(f"Failed to create shareable environment: {e}")
+        return 1
+
+
+def cmd_import(args):
+    """Import a shared environment snapshot"""
+    share_file = Path(args.file)
+
+    if not share_file.exists():
+        error(f"File not found: {share_file}")
+        return 1
+
+    if not venv_exists():
+        error("User venv not initialized. Run: sysvenv init")
+        return 1
+
+    try:
+        # Read the file
+        content = share_file.read_text()
+
+        # Extract metadata from comments
+        metadata = {}
+        freeze_lines = []
+        for line in content.split('\n'):
+            if line.startswith('# Python:'):
+                metadata['python'] = line.split(':', 1)[1].strip()
+            elif line.startswith('# Packages:'):
+                metadata['packages'] = line.split(':', 1)[1].strip()
+            elif line.startswith('# By:'):
+                metadata['created_by'] = line.split(':', 1)[1].strip()
+            elif not line.startswith('#'):
+                freeze_lines.append(line)
+
+        freeze = '\n'.join(freeze_lines).strip()
+        pkg_count = len([l for l in freeze.split('\n') if l.strip()])
+
+        heading("Importing shared environment")
+        print(f"  From: {metadata.get('created_by', 'unknown')}")
+        print(f"  Python: {metadata.get('python', 'unknown')}")
+        print(f"  Packages: {pkg_count}")
+
+        # Check Python version compatibility
+        python_bin = VENV_PATH / "bin" / "python3"
+        result = run_command([str(python_bin), "--version"])
+        current_python = result.stdout.strip()
+
+        if metadata.get('python') and metadata['python'] != current_python:
+            warning(f"Python version mismatch!")
+            print(f"  Shared environment: {metadata['python']}")
+            print(f"  Your environment: {current_python}")
+            if not confirm_action("Continue anyway?"):
+                info("Cancelled")
+                return 0
+
+        if args.dry_run:
+            warning("DRY RUN - no changes will be made")
+            print("\nWould restore packages:")
+            for line in freeze.split('\n')[:10]:
+                if line.strip():
+                    print(f"  {line}")
+            if pkg_count > 10:
+                print(f"  ... and {pkg_count - 10} more")
+            return 0
+
+        # Confirm restoration
+        if not confirm_action(f"This will replace your current venv with {pkg_count} packages. Continue?"):
+            info("Cancelled")
+            return 0
+
+        # Check disk space
+        if not check_disk_space(SYSVENV_ROOT, 500):
+            error("Low disk space (need at least 500MB)")
+            return 1
+
+        # Nuke and recreate venv
+        info("Removing current venv...")
+        safe_rmtree(VENV_PATH)
+
+        info("Creating fresh venv...")
+        venv.create(VENV_PATH, with_pip=True, symlinks=True)
+
+        # Upgrade pip
+        pip_bin = VENV_PATH / "bin" / "pip"
+        run_command([str(pip_bin), "install", "--upgrade", "pip", "-q"])
+
+        # Restore packages
+        if freeze:
+            info(f"Installing {pkg_count} packages...")
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                f.write(freeze)
+                temp_file = f.name
+
+            try:
+                run_command([str(pip_bin), "install", "-r", temp_file], capture=False)
+            finally:
+                os.unlink(temp_file)
+
+        success("Imported shared environment successfully")
+
+        return 0
+
+    except Exception as e:
+        error(f"Import failed: {e}")
+        error("Your venv may be in an inconsistent state. Run 'sysvenv doctor --fix' to repair.")
+        return 1
+
+
 # ============================================================================
 # Internal commands (used by pip wrapper)
 # ============================================================================
@@ -950,13 +1420,19 @@ def cmd_snapshot_before(args):
     entry_id = get_history_id()
     freeze = pip_freeze()
 
+    # Track provenance for packages being installed
+    provenance = {}
+    if args.command and args.command[0] == 'install':
+        provenance = track_installation_provenance(args.command)
+
     entry = {
         "id": entry_id,
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "user": os.getenv("USER", "unknown"),
         "command": " ".join(args.command),
         "pip_args": args.command,
-        "freeze": freeze
+        "freeze": freeze,
+        "provenance": provenance
     }
 
     before_file = HISTORY_PATH / f"{entry_id:03d}_before.json"
@@ -1013,6 +1489,166 @@ def cmd_snapshot_after(args):
     return 0
 
 
+def cmd_check_conflicts(args):
+    """Internal: Check for system package conflicts before pip install"""
+    # Extract package names from pip command
+    packages = extract_package_names(args.command)
+
+    if not packages:
+        return 0
+
+    # Check for system package conflicts
+    conflicts = check_system_packages(packages)
+
+    if conflicts:
+        warning("System package conflicts detected:")
+        for pkg, sys_pkg in conflicts:
+            print(f"  • {pkg}: system has {sys_pkg} installed")
+
+        print("\n💡 Recommendations:")
+        print("  1. Use system package manager (apt/yum) for system-wide installs")
+        print("  2. Continue with pip (may cause conflicts)")
+        print("  3. Create isolated project venv (recommended for projects)")
+        print()
+
+    return 0
+
+
+def cmd_check_orphans(args):
+    """Internal: Check for orphaned packages after uninstall"""
+    # Get removed packages from the most recent operation
+    history_files = sorted(HISTORY_PATH.glob("*_after.json"))
+    if not history_files:
+        return 0
+
+    # Load the most recent operation
+    with open(history_files[-1]) as f:
+        entry = json.load(f)
+
+    changes = entry.get("changes", {})
+    removed = changes.get("removed", [])
+
+    if not removed:
+        return 0
+
+    # Extract package names (remove version info)
+    removed_names = [pkg.split('==')[0] for pkg in removed]
+
+    # Find orphans
+    orphans = find_orphan_packages(removed_names)
+
+    if orphans:
+        print()
+        warning("Orphaned packages detected:")
+        print("  These packages were only required by what you removed:")
+        for pkg in orphans:
+            print(f"    • {pkg}")
+
+        print("\n💡 You can remove them with:")
+        cprint(f"  pip uninstall {' '.join(orphans)}", Colors.CYAN)
+        print()
+
+    return 0
+
+
+def detect_version_downgrades(pip_args: List[str]) -> List[Tuple[str, str, str]]:
+    """Detect if pip install would downgrade packages
+
+    Returns list of (package, current_version, new_version) tuples for downgrades
+    """
+    if not venv_exists():
+        return []
+
+    pip_bin = VENV_PATH / "bin" / "pip"
+
+    # Get current package versions
+    current_packages = parse_freeze_to_dict(pip_freeze())
+
+    downgrades = []
+
+    try:
+        # Run pip install with --dry-run to see what would happen
+        cmd = [str(pip_bin), "install", "--dry-run"] + pip_args[1:]  # Skip 'install' in args
+        result = run_command(cmd, check=False, capture=True)
+
+        if result.returncode != 0:
+            return []  # Can't determine, let pip handle it
+
+        # Parse output for version changes
+        # Look for patterns like "Would install package-1.0.0" when package-2.0.0 is installed
+        output = result.stdout + result.stderr
+
+        for line in output.split('\n'):
+            # pip shows "Would install: package==1.0.0"
+            if 'Would install' in line or 'would be installed' in line.lower():
+                # Extract packages from line
+                # Format varies, but typically: "package==version"
+                parts = line.split()
+                for part in parts:
+                    if '==' in part:
+                        pkg_name, new_version = part.strip(',').split('==', 1)
+                        pkg_name_lower = pkg_name.lower()
+
+                        # Check if this is a downgrade
+                        if pkg_name_lower in current_packages:
+                            current_version = current_packages[pkg_name_lower]
+                            # Simple version comparison (not perfect but MVP)
+                            if is_version_downgrade(current_version, new_version):
+                                downgrades.append((pkg_name, current_version, new_version))
+
+    except Exception:
+        # If we can't detect, don't block the install
+        return []
+
+    return downgrades
+
+
+def is_version_downgrade(current: str, new: str) -> bool:
+    """Simple version comparison to detect downgrades
+
+    MVP: Uses string comparison for major version numbers
+    """
+    try:
+        # Parse versions (handle X.Y.Z format)
+        current_parts = [int(x) for x in current.split('.')[:3]]
+        new_parts = [int(x) for x in new.split('.')[:3]]
+
+        # Pad to same length
+        while len(current_parts) < 3:
+            current_parts.append(0)
+        while len(new_parts) < 3:
+            new_parts.append(0)
+
+        # Compare
+        return new_parts < current_parts
+
+    except (ValueError, AttributeError):
+        # Can't parse, assume not a downgrade
+        return False
+
+
+def cmd_check_downgrades(args):
+    """Internal: Check for potential downgrades before install"""
+    if not args.command or args.command[0] != 'install':
+        return 0
+
+    downgrades = detect_version_downgrades(args.command)
+
+    if downgrades:
+        print()
+        warning("Potential version downgrades detected:")
+        for pkg, current, new in downgrades:
+            print(f"  • {pkg}: {current} → {new}")
+
+        print("\n💡 This may break dependencies. Consider:")
+        print("  1. Check why downgrade is happening")
+        print("  2. Use specific versions: pip install package==version")
+        print("  3. Create a test venv first")
+        print()
+
+    return 0
+
+
 # ============================================================================
 # CLI Setup
 # ============================================================================
@@ -1045,6 +1681,7 @@ def main():
     # history
     parser_history = subparsers.add_parser('history', help='Show operation history')
     parser_history.add_argument('--limit', type=int, help='Limit number of entries')
+    parser_history.add_argument('--detailed', action='store_true', help='Show provenance information')
     parser_history.set_defaults(func=cmd_history)
 
     # diff
@@ -1080,6 +1717,17 @@ def main():
     parser_list = subparsers.add_parser('list-snapshots', help='List available snapshots')
     parser_list.set_defaults(func=cmd_list_snapshots)
 
+    # share
+    parser_share = subparsers.add_parser('share', help='Export environment for sharing')
+    parser_share.add_argument('name', nargs='?', help='Name for shared environment (optional)')
+    parser_share.set_defaults(func=cmd_share)
+
+    # import
+    parser_import = subparsers.add_parser('import', help='Import shared environment')
+    parser_import.add_argument('file', help='Path to .sysvenv file')
+    parser_import.add_argument('--dry-run', action='store_true', help='Show what would be done')
+    parser_import.set_defaults(func=cmd_import)
+
     # Internal commands (used by pip wrapper)
     parser_sb = subparsers.add_parser('_snapshot-before', help=argparse.SUPPRESS)
     parser_sb.add_argument('command', nargs='+')
@@ -1088,6 +1736,18 @@ def main():
     parser_sa = subparsers.add_parser('_snapshot-after', help=argparse.SUPPRESS)
     parser_sa.add_argument('command', nargs='+')
     parser_sa.set_defaults(func=cmd_snapshot_after)
+
+    parser_cc = subparsers.add_parser('_check-conflicts', help=argparse.SUPPRESS)
+    parser_cc.add_argument('command', nargs='+')
+    parser_cc.set_defaults(func=cmd_check_conflicts)
+
+    parser_co = subparsers.add_parser('_check-orphans', help=argparse.SUPPRESS)
+    parser_co.add_argument('command', nargs='+')
+    parser_co.set_defaults(func=cmd_check_orphans)
+
+    parser_cd = subparsers.add_parser('_check-downgrades', help=argparse.SUPPRESS)
+    parser_cd.add_argument('command', nargs='+')
+    parser_cd.set_defaults(func=cmd_check_downgrades)
 
     # Parse and run
     args = parser.parse_args()
