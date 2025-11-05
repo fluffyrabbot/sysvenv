@@ -108,13 +108,14 @@ if [ "$USE_WRAPPER" = true ] && [[ "$FIRST_ARG" =~ ^($SNAPSHOT_OPERATIONS)$ ]]; 
     SHOULD_SNAPSHOT=true
 fi
 
-# Take before snapshot and check for conflicts
+# Take before snapshot and check for conflicts/downgrades
 if [ "$SHOULD_SNAPSHOT" = true ]; then
     # Check if sysvenv exists
     if command -v sysvenv >/dev/null 2>&1; then
-        # Check for system package conflicts on install operations
+        # Check for system package conflicts and downgrades on install operations
         if [ "$FIRST_ARG" = "install" ]; then
             sysvenv _check-conflicts "$@" 2>/dev/null || true
+            sysvenv _check-downgrades "$@" 2>/dev/null || true
         fi
 
         sysvenv _snapshot-before "$@" 2>/dev/null || true
@@ -129,12 +130,17 @@ fi
 EXIT_CODE=$?
 
 # ============================================================================
-# Take after snapshot
+# Take after snapshot and check for orphans
 # ============================================================================
 
 if [ "$SHOULD_SNAPSHOT" = true ] && [ $EXIT_CODE -eq 0 ]; then
     if command -v sysvenv >/dev/null 2>&1; then
         sysvenv _snapshot-after "$@" 2>/dev/null || true
+
+        # Check for orphaned packages after uninstall
+        if [ "$FIRST_ARG" = "uninstall" ]; then
+            sysvenv _check-orphans "$@" 2>/dev/null || true
+        fi
     fi
 fi
 
