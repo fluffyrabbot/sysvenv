@@ -1,288 +1,54 @@
-# sysvenv - Two-Tier Python Package System
+# sysvenv
 
-**Make `pip install` just work.** No sudo, no activation, no ceremony.
+**Make `pip install` just work.** No sudo, no activation, no ceremony. No dignity left to lose.
 
-## What is this?
+## The Pitch
 
-A two-tier Python package architecture that gives you:
+You want to install a package. The OS says "externally managed environment." You consider sudo. You realize you've already broken three distros this year doing that. 
 
-1. **System venv** (`/opt/system-python/`) - Root-locked, for OS components only
-2. **User venv** (`~/.local/python-packages/`) - Your personal packages, no sudo needed
+`sysvenv` fixes this by giving you a personal playground that your shell loves more than the system defaults.
 
-**Core principle:** When you run `pip install`, it should "just work" and go to your personal venv. Zero friction.
-
-## Features
-
-- **Zero-friction installs** - `pip install` automatically goes to your user venv
-- **Automatic snapshots** - Every install/uninstall is tracked
-- **Easy undo** - Roll back mistakes with `sysvenv undo`
-- **Named snapshots** - Save and restore package sets
-- **Complete isolation** - User packages can't break system
-- **Composable** - Works alongside project-local venvs
+- **Zero-friction installs:** `pip install` just goes where it should.
+- **Automatic snapshots:** Every mistake is recorded for future embarrassment.
+- **Undo button:** Pretend that last install never happened.
+- **Isolation:** Your "experimental" ML stack won't break your terminal's ability to render text.
 
 ## Quick Start
 
-### Install
-
+### 1. Install
 ```bash
-# Clone and install
-git clone <repo-url>
+git clone https://github.com/fluffyrabbot/sysvenv
 cd sysvenv
 ./install.sh
-```
-
-This will:
-1. Install `sysvenv` to `~/.local/bin`
-2. Initialize your user venv
-3. Add PATH to your shell config
-
-### Reload your shell
-
-```bash
 source ~/.bashrc  # or ~/.zshrc
 ```
 
-### Verify
-
+### 2. Live your life
 ```bash
-sysvenv status
-```
-
-### Use it
-
-```bash
-# Just install packages like normal
+# Just install things.
 pip install requests black pytest
 
-# See what changed
-sysvenv diff
+# Did it break?
+sysvenv undo
 
-# View history
+# Want to see the damage?
 sysvenv history
-
-# Undo last install
-sysvenv undo
 ```
 
-## Commands
+## Documentation
 
-### Setup
+For people who actually read instructions:
 
-- `sysvenv init` - Initialize user venv (done by installer)
-- `sysvenv status` - Show current status
-- `sysvenv doctor [--fix]` - Health check and repair
-
-### History & Undo
-
-- `sysvenv history [--limit N]` - Show operation history
-- `sysvenv diff [N]` - Show changes from operation N (default: last)
-- `sysvenv undo [N]` - Rollback last N operations (default: 1)
-
-### Snapshots
-
-- `sysvenv snapshot <name>` - Save current package set
-- `sysvenv restore <name>` - Restore named snapshot
-- `sysvenv list-snapshots` - List available snapshots
-
-### Maintenance
-
-- `sysvenv clean` - Nuke and recreate venv
-- `sysvenv clean --keep-baseline` - Restore to initial state
-
-## How It Works
-
-### PATH Precedence
-
-```
-Project venv (if activated)  ← Highest priority
-    ↓
-User venv (~/.local/python-packages/venv)
-    ↓
-System venv (/opt/system-python/venv)  ← System services only
-```
-
-When you type `python3` or `pip`, your shell finds the first one in PATH.
-
-### User Setup
-
-After installation, your `~/.bashrc` has:
-
-```bash
-export PATH="$HOME/.local/python-packages/venv/bin:$PATH"
-```
-
-This makes your user venv's Python and pip take precedence.
-
-### System Setup (Optional)
-
-System administrators can install system-wide:
-
-```bash
-sudo ./install.sh --system
-```
-
-This installs:
-- `sysvenv` to `/usr/local/bin/`
-- pip wrapper to `/usr/local/bin/pip`
-- Optionally creates `/opt/system-python/venv`
-
-## Examples
-
-### Install packages
-
-```bash
-pip install requests black pytest
-# Automatically snapshotted, shows diff
-```
-
-### Undo a mistake
-
-```bash
-pip install some-bad-package
-# Oh no, this broke things!
-
-sysvenv undo
-# Back to previous state
-```
-
-### Save your dev environment
-
-```bash
-# Install your tools
-pip install pytest black mypy ruff httpie
-
-# Save it
-sysvenv snapshot dev-tools
-
-# Later, after messing around...
-sysvenv restore dev-tools
-# Back to your saved state
-```
-
-### Switch between different package sets
-
-```bash
-# ML work
-sysvenv restore ml-stack  # numpy, pandas, scikit-learn, etc.
-
-# Web dev work
-sysvenv restore webdev    # flask, requests, etc.
-```
-
-### Start completely fresh
-
-```bash
-sysvenv clean
-# Venv deleted and recreated, empty slate
-```
-
-## Project Venvs Still Work
-
-This doesn't replace project-local venvs. They work exactly as before:
-
-```bash
-# Create project venv
-python3 -m venv myproject/venv
-
-# Activate it
-source myproject/venv/bin/activate
-
-# Now pip uses project venv (highest priority in PATH)
-pip install -r requirements.txt
-```
-
-When you deactivate, you're back to your user venv.
-
-## Directory Structure
-
-```
-~/.local/python-packages/
-├── venv/                    # Your Python packages
-├── history/                 # Automatic snapshots
-│   ├── 001_before.json
-│   ├── 001_after.json
-│   └── ...
-├── snapshots/               # Named snapshots
-│   ├── baseline.txt
-│   ├── dev-tools.txt
-│   └── ...
-└── config.toml              # Configuration
-```
-
-## Configuration
-
-Edit `~/.local/python-packages/config.toml`:
-
-```toml
-[history]
-max_entries = 100              # Keep last 100 operations
-auto_snapshot = true           # Snapshot before installs
-show_diff_after_install = true # Show diff after install
-
-[snapshots]
-auto_baseline = true           # Create baseline on init
-
-[ui]
-color = true
-verbose = false
-```
-
-## Troubleshooting
-
-### sysvenv: command not found
-
-Your PATH doesn't include `~/.local/bin`. Add to `~/.bashrc`:
-
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-Then: `source ~/.bashrc`
-
-### pip still asks for sudo
-
-You're using the system pip. Make sure:
-
-1. User venv is initialized: `sysvenv status`
-2. User venv is in PATH: `which pip` should show `~/.local/python-packages/venv/bin/pip`
-
-### Want to use system Python temporarily
-
-```bash
-# Use full path to bypass user venv
-/usr/bin/python3
-```
-
-Or remove user venv from PATH temporarily:
-
-```bash
-export PATH=${PATH#*:}  # Remove first entry (user venv)
-```
-
-## Uninstall
-
-```bash
-# Remove tools
-rm ~/.local/bin/sysvenv
-
-# Remove user venv
-rm -rf ~/.local/python-packages
-
-# Remove PATH line from ~/.bashrc
-# (edit manually)
-```
+- [Usage & Examples](docs/usage.md) - How to actually use the thing.
+- [Internals](docs/internals.md) - How we mess with your PATH.
+- [Troubleshooting](docs/troubleshooting.md) - When things inevitably go wrong.
+- [NORTHSTAR2.md](NORTHSTAR2.md) - The grand architectural vision (for the brave).
 
 ## Philosophy
 
 > "The right defaults should be invisible. Users should never think about where their packages go. They should just go to the right place."
 
-This is not a security tool. This is not a production tool. This is a tool to make Python packaging suck less for everyday development.
-
-## See Also
-
-- [NORTHSTAR2.md](NORTHSTAR2.md) - Full vision and architecture
-- `sysvenv --help` - Command help
-- `sysvenv <command> --help` - Command-specific help
+This is not a security tool. This is not a production tool. This is a tool to make Python packaging suck slightly less for everyday development.
 
 ## License
 
