@@ -509,5 +509,141 @@ class TestEdgeCases(TestSysvenvBase):
         self.assertEqual(result.returncode, 0)
 
 
+class TestPipOperationsOffline(unittest.TestCase):
+    """Exercise real locking and subprocess boundaries without package downloads."""
+
+    def setUp(self):
+        import sys
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.source = Path(__file__).resolve().parent
+        self.history = self.root / 'history'
+        self.bin = self.root / 'venv' / 'bin'
+        self.bin.mkdir(parents=True)
+        self.pip = self.bin / 'pip'
+        self.pip.write_text('#!' + sys.executable + '\n' + '''
+import json, sys, time
+from pathlib import Path
+root = Path(__file__).resolve().parents[2]
+state = root / 'packages.txt'
+args = sys.argv[1:]
+if args == ['freeze']:
+    if (root / 'fail-freeze').exists():
+        sys.exit(9)
+    print(state.read_text() if state.exists() else '', end='')
+    sys.exit(0)
+if '--dry-run' in args or args[0] == 'show':
+    sys.exit(0)
+name = args[-1]
+with (root / 'calls.jsonl').open('a') as f:
+    f.write(json.dumps(args) + '\\n')
+(root / (name + '.started')).touch()
+if name == 'first':
+    deadline = time.monotonic() + 10
+    while not (root / 'release').exists():
+        if time.monotonic() > deadline:
+            sys.exit(99)
+        time.sleep(.01)
+with state.open('a') as f:
+    f.write(name + '==1.0\\n')
+sys.exit(7 if name == 'failure' else 0)
+''')
+        self.pip.chmod(0o755)
+        self.launcher = self.root / 'sysvenv'
+        self.launcher.write_text('#!' + sys.executable + '\n' + f'''
+from pathlib import Path
+scope = {{'__name__': 'fixture'}}
+source = Path({str(self.source / 'sysvenv')!r})
+exec(compile(source.read_text(), str(source), 'exec'), scope)
+root = Path({str(self.root)!r})
+for name, suffix in {{'SYSVENV_ROOT': '.', 'VENV_PATH': 'venv',
+                     'HISTORY_PATH': 'history', 'SNAPSHOTS_PATH': 'snapshots',
+                     'LOCK_FILE': '.sysvenv.lock'}}.items():
+    scope[name] = root / suffix
+raise SystemExit(scope['main']())
+''')
+        self.launcher.chmod(0o755)
+
+    def run_operation(self, *args):
+        return subprocess.run([str(self.launcher), '_pip', *args],
+                              capture_output=True, text=True, timeout=15)
+
+    def test_failed_mutation_records_partial_change_and_exit_code(self):
+        result = self.run_operation('install', '--no-deps', 'failure')
+        self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+        after = json.loads((self.history / '001_after.json').read_text())
+        self.assertEqual(after['exit_code'], 7)
+        self.assertEqual(after['pip_args'], ['install', '--no-deps', 'failure'])
+        self.assertEqual(after['changes']['added'], ['failure==1.0'])
+        self.assertEqual(self.run_operation('install', 'next').returncode, 0)
+        self.assertTrue((self.history / '002_after.json').exists())
+
+    def test_concurrent_mutations_have_contiguous_isolated_snapshots(self):
+        import time
+        first = subprocess.Popen([str(self.launcher), '_pip', 'install', 'first'],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: first.poll() is None and first.kill())
+        deadline = time.monotonic() + 5
+        while not (self.root / 'first.started').exists():
+            self.assertIsNone(first.poll())
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        second = subprocess.Popen([str(self.launcher), '_pip', 'install', 'second'],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: second.poll() is None and second.kill())
+        try:
+            # Hold the first mutation open while the second attempts to enter.
+            with self.assertRaises(subprocess.TimeoutExpired):
+                second.communicate(timeout=.25)
+            self.assertFalse((self.root / 'second.started').exists())
+        finally:
+            (self.root / 'release').touch()
+        first.communicate(timeout=10)
+        second.communicate(timeout=10)
+        self.assertEqual((first.returncode, second.returncode), (0, 0))
+        entries = [json.loads((self.history / name).read_text()) for name in
+                   ('001_before.json', '001_after.json', '002_before.json', '002_after.json')]
+        self.assertEqual(entries[0]['freeze'], '')
+        self.assertEqual(entries[1]['freeze'], entries[2]['freeze'])
+        self.assertEqual(entries[1]['changes']['added'], ['first==1.0'])
+        self.assertEqual(entries[3]['changes']['added'], ['second==1.0'])
+
+    def test_failed_before_snapshot_prevents_mutation(self):
+        (self.root / 'fail-freeze').touch()
+        self.assertNotEqual(self.run_operation('install', 'never').returncode, 0)
+        self.assertFalse((self.root / 'calls.jsonl').exists())
+
+    def test_ids_cross_lexical_sort_boundary(self):
+        self.history.mkdir()
+        (self.history / '999_before.json').write_text('{"id":999}')
+        self.assertEqual(self.run_operation('install', 'new').returncode, 0)
+        self.assertTrue((self.history / '1000_after.json').exists())
+        self.assertFalse((self.history / '999_after.json').exists())
+
+    def test_wrapper_routes_operation_and_preserves_pip_options(self):
+        # Only replace target paths in a disposable copy; never touch real venvs.
+        wrapper = self.root / 'pip-wrapper'
+        source = (self.source / 'pip-wrapper').read_text()
+        source = source.replace('USER_VENV="$HOME/.local/python-packages/venv"',
+                                'USER_VENV=' + str(self.root / 'venv'))
+        wrapper.write_text(source)
+        env = dict(os.environ, PATH=str(self.root) + os.pathsep + os.environ['PATH'])
+        env.pop('VIRTUAL_ENV', None)
+        if os.geteuid() == 0:
+            self.skipTest('User wrapper routing requires an unprivileged process')
+        result = subprocess.run(['bash', str(wrapper), 'install', '--no-deps', 'failure'],
+                                env=env, cwd=self.root, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+        self.assertEqual(json.loads((self.history / '001_after.json').read_text())['exit_code'], 7)
+
+    def test_wrapper_activated_environment_bypasses_history(self):
+        result = subprocess.run(['bash', str(self.source / 'pip-wrapper'), 'install', 'direct'],
+                                env=dict(os.environ, VIRTUAL_ENV=str(self.root / 'venv')),
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0)
+        self.assertFalse(self.history.exists())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

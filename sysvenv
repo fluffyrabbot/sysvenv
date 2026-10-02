@@ -147,33 +147,14 @@ def pip_freeze() -> str:
 
 
 def get_history_id() -> int:
-    """Get next history entry ID with file locking to prevent race conditions"""
-    ensure_dirs()
-
-    # Use file locking to prevent concurrent access
-    lock_file = LOCK_FILE
-    lock_file.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(lock_file, 'w') as lock_fd:
+    """Allocate under the operation lock, held until the snapshot is written."""
+    ids = []
+    for path in HISTORY_PATH.glob("*_before.json"):
         try:
-            # Acquire exclusive lock (blocks if another process has it)
-            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
-
-            if not HISTORY_PATH.exists():
-                return 1
-
-            max_id = 0
-            for file in HISTORY_PATH.glob("*_before.json"):
-                try:
-                    id_str = file.stem.split("_")[0]
-                    max_id = max(max_id, int(id_str))
-                except (ValueError, IndexError):
-                    continue
-
-            return max_id + 1
-        finally:
-            # Release lock
-            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+            ids.append(int(path.stem.split("_")[0]))
+        except ValueError:
+            continue
+    return max(ids, default=0) + 1
 
 
 def venv_exists() -> bool:
@@ -1413,8 +1394,8 @@ def cmd_import(args):
 # Internal commands (used by pip wrapper)
 # ============================================================================
 
-def cmd_snapshot_before(args):
-    """Internal: Take before snapshot"""
+def snapshot_before(args):
+    """Capture the starting state while holding the operation lock."""
     ensure_dirs()
 
     entry_id = get_history_id()
@@ -1438,20 +1419,11 @@ def cmd_snapshot_before(args):
     before_file = HISTORY_PATH / f"{entry_id:03d}_before.json"
     atomic_write_json(before_file, entry)
 
-    return 0
+    return entry
 
 
-def cmd_snapshot_after(args):
-    """Internal: Take after snapshot"""
-    # Find the most recent before snapshot
-    before_files = sorted(HISTORY_PATH.glob("*_before.json"))
-    if not before_files:
-        return 0
-
-    before_file = before_files[-1]
-    with open(before_file) as f:
-        before_entry = json.load(f)
-
+def snapshot_after(before_entry, exit_code):
+    """Finish the exact operation, including failed pip mutations."""
     entry_id = before_entry["id"]
     before_freeze = before_entry["freeze"]
     after_freeze = pip_freeze()
@@ -1466,7 +1438,7 @@ def cmd_snapshot_after(args):
         "removed": removed,
         "modified": modified
     }
-    after_entry["exit_code"] = 0
+    after_entry["exit_code"] = exit_code
 
     after_file = HISTORY_PATH / f"{entry_id:03d}_after.json"
     atomic_write_json(after_file, after_entry)
@@ -1487,6 +1459,45 @@ def cmd_snapshot_after(args):
         info(f"Saved as operation #{entry_id}")
 
     return 0
+
+
+def cmd_pip(args):
+    """Own before/pip/after as one serialized user-venv operation."""
+    if not args.command or args.command[0] not in {'install', 'uninstall', 'upgrade'}:
+        raise ValueError("_pip requires a pip mutation command")
+    pip_bin = VENV_PATH / "bin" / "pip"
+    if not pip_bin.is_file():
+        raise FileNotFoundError(pip_bin)
+    ensure_dirs()
+    with open(LOCK_FILE, 'a') as lock_fd:
+        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
+        # Advisory checks must not prevent a requested pip operation.
+        if args.command[0] == 'install':
+            for check in (cmd_check_conflicts, cmd_check_downgrades):
+                try:
+                    check(args)
+                except Exception as exc:
+                    warning(f"Pre-install check unavailable: {exc}")
+        before_entry = snapshot_before(args)
+        exit_code = 1
+        try:
+            result = subprocess.run([str(pip_bin), *args.command], check=False)
+            exit_code = result.returncode
+            if exit_code < 0:
+                exit_code = 128 - exit_code
+        except KeyboardInterrupt:
+            exit_code = 130
+        finally:
+            try:
+                snapshot_after(before_entry, exit_code)
+            except Exception as exc:
+                warning(f"Could not finish operation #{before_entry['id']}: {exc}")
+        if args.command[0] == 'uninstall' and exit_code == 0:
+            try:
+                cmd_check_orphans(args, before_entry['id'])
+            except Exception as exc:
+                warning(f"Orphan check unavailable: {exc}")
+        return exit_code
 
 
 def cmd_check_conflicts(args):
@@ -1514,15 +1525,17 @@ def cmd_check_conflicts(args):
     return 0
 
 
-def cmd_check_orphans(args):
+def cmd_check_orphans(args, entry_id=None):
     """Internal: Check for orphaned packages after uninstall"""
-    # Get removed packages from the most recent operation
-    history_files = sorted(HISTORY_PATH.glob("*_after.json"))
-    if not history_files:
-        return 0
-
-    # Load the most recent operation
-    with open(history_files[-1]) as f:
+    if entry_id is not None:
+        after_file = HISTORY_PATH / f"{entry_id:03d}_after.json"
+    else:
+        history_files = sorted(HISTORY_PATH.glob("*_after.json"),
+                               key=lambda path: int(path.stem.split("_")[0]))
+        if not history_files:
+            return 0
+        after_file = history_files[-1]
+    with open(after_file) as f:
         entry = json.load(f)
 
     changes = entry.get("changes", {})
@@ -1729,13 +1742,9 @@ def main():
     parser_import.set_defaults(func=cmd_import)
 
     # Internal commands (used by pip wrapper)
-    parser_sb = subparsers.add_parser('_snapshot-before', help=argparse.SUPPRESS)
-    parser_sb.add_argument('command', nargs='+')
-    parser_sb.set_defaults(func=cmd_snapshot_before)
-
-    parser_sa = subparsers.add_parser('_snapshot-after', help=argparse.SUPPRESS)
-    parser_sa.add_argument('command', nargs='+')
-    parser_sa.set_defaults(func=cmd_snapshot_after)
+    parser_pip = subparsers.add_parser('_pip', help=argparse.SUPPRESS)
+    parser_pip.add_argument('command', nargs=argparse.REMAINDER)
+    parser_pip.set_defaults(func=cmd_pip)
 
     parser_cc = subparsers.add_parser('_check-conflicts', help=argparse.SUPPRESS)
     parser_cc.add_argument('command', nargs='+')
