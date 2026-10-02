@@ -637,12 +637,145 @@ raise SystemExit(scope['main']())
         self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
         self.assertEqual(json.loads((self.history / '001_after.json').read_text())['exit_code'], 7)
 
+    def test_wrapper_global_options_preserved(self):
+        wrapper = self.root / 'pip-wrapper'
+        wrapper.write_text((self.source / 'pip-wrapper').read_text().replace(
+            'USER_VENV="$HOME/.local/python-packages/venv"',
+            'USER_VENV=' + str(self.root / 'venv')))
+        env = dict(os.environ, PATH=str(self.root) + os.pathsep + os.environ['PATH'])
+        env.pop('VIRTUAL_ENV', None)
+        if os.geteuid() == 0:
+            self.skipTest('User routing requires an unprivileged process')
+        result = subprocess.run(['bash', str(wrapper), '--quiet', 'install', 'failure'],
+                                env=env, cwd=self.root, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+        self.assertEqual(json.loads((self.history / '001_after.json').read_text())['pip_args'],
+                         ['--quiet', 'install', 'failure'])
+
     def test_wrapper_activated_environment_bypasses_history(self):
         result = subprocess.run(['bash', str(self.source / 'pip-wrapper'), 'install', 'direct'],
                                 env=dict(os.environ, VIRTUAL_ENV=str(self.root / 'venv')),
                                 capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 0)
         self.assertFalse(self.history.exists())
+
+
+class TestEnvironmentWritersOffline(unittest.TestCase):
+    run_operation = TestPipOperationsOffline.run_operation
+    def setUp(self):
+        TestPipOperationsOffline.setUp(self)
+        (self.bin / 'python3').touch()
+        # Replace creation/removal and command execution only in a child fixture.
+        # All production command handlers and flock boundaries still execute.
+        text = self.launcher.read_text()
+        fake = """
+import subprocess, time
+scope['CONFIG_PATH'] = root / 'config.toml'
+scope['check_disk_space'] = lambda *a: True
+scope['confirm_action'] = lambda *a: not (root / 'cancel').exists()
+def remove(path):
+    (root / 'removed').touch()
+def create(*a, **kw):
+    (root / 'created').touch()
+    if (root / 'fail-create').exists():
+        raise RuntimeError('synthetic create failure')
+    if (root / 'hold-create').exists():
+        while not (root / 'release-create').exists():
+            time.sleep(.01)
+scope['safe_rmtree'] = remove
+scope['venv'].create = create
+scope['run_command'] = lambda *a, **kw: subprocess.CompletedProcess(a, 0, 'Python fixture', '')
+"""
+        self.launcher.write_text(text.replace("raise SystemExit(scope['main']())", fake + "\nraise SystemExit(scope['main']())"))
+        (self.root / 'snapshots').mkdir()
+        (self.root / 'snapshots' / 'saved.txt').write_text('')
+        (self.root / 'shared.sysvenv').write_text('')
+        self.history.mkdir()
+        (self.history / '001_before.json').write_text('{"freeze":""}')
+        (self.history / '001_after.json').write_text('{}')
+
+    def start(self, *args):
+        process = subprocess.Popen([str(self.launcher), *args], stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True)
+        def cleanup():
+            if process.poll() is None:
+                process.kill()
+            process.communicate()
+        self.addCleanup(cleanup)
+        return process
+
+    def wait_file(self, name):
+        import time
+        deadline = time.monotonic() + 5
+        while not (self.root / name).exists():
+            self.assertLess(time.monotonic(), deadline, name)
+            time.sleep(.01)
+
+    def test_all_rebuilders_wait_for_pip(self):
+        first = self.start('_pip', 'install', 'first')
+        self.wait_file('first.started')
+        writers = [self.start(*args) for args in
+                   [('restore', 'saved'), ('import', str(self.root / 'shared.sysvenv')),
+                    ('clean',), ('undo',), ('init',)]]
+        try:
+            for process in writers:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    process.communicate(timeout=.15)
+            self.assertFalse((self.root / 'removed').exists())
+        finally:
+            (self.root / 'release').touch()
+        first.communicate(timeout=10)
+        for process in writers:
+            out, err = process.communicate(timeout=10)
+            self.assertEqual(process.returncode, 0, out + err)
+
+    def test_pip_waits_for_rebuild_and_waiter_interrupt_releases(self):
+        import signal
+        (self.root / 'hold-create').touch()
+        writer = self.start('restore', 'saved')
+        self.wait_file('created')
+        waiter = self.start('_pip', 'install', 'second')
+        with self.assertRaises(subprocess.TimeoutExpired):
+            waiter.communicate(timeout=.25)
+        self.assertFalse((self.root / 'second.started').exists())
+        waiter.send_signal(signal.SIGINT)
+        waiter.communicate(timeout=5)
+        self.assertEqual(waiter.returncode, 130)
+        (self.root / 'release-create').touch()
+        writer.communicate(timeout=5)
+        self.assertEqual(self.run_operation('install', 'retry').returncode, 0)
+
+    def test_interrupted_rebuild_releases_lock_for_retry(self):
+        import signal
+        (self.root / 'hold-create').touch()
+        writer = self.start('restore', 'saved')
+        self.wait_file('created')
+        writer.send_signal(signal.SIGINT)
+        writer.communicate(timeout=5)
+        self.assertEqual(writer.returncode, 130)
+        (self.root / 'release-create').touch()
+        retry = self.start('restore', 'saved')
+        retry.communicate(timeout=5)
+        self.assertEqual(retry.returncode, 0)
+
+    def test_doctor_nested_init_does_not_deadlock(self):
+        (self.bin / 'python3').unlink()
+        doctor = self.start('doctor', '--fix')
+        out, err = doctor.communicate(timeout=5)
+        self.assertEqual(doctor.returncode, 0, out + err)
+        self.assertTrue((self.root / 'created').exists())
+
+    def test_failure_and_cancellation_release_lock_preserve_recovery(self):
+        before = (self.history / '001_before.json').read_bytes()
+        for marker, expected in [('cancel', 0), ('fail-create', 1)]:
+            (self.root / marker).touch()
+            result = subprocess.run([str(self.launcher), 'restore', 'saved'],
+                                    capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, expected)
+            (self.root / marker).unlink()
+            self.assertEqual(self.run_operation('install', 'retry').returncode, 0)
+            self.assertEqual((self.history / '001_before.json').read_bytes(), before)
+            self.assertTrue((self.root / 'snapshots' / 'saved.txt').exists())
 
 
 if __name__ == "__main__":

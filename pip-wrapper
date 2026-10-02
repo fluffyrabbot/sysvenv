@@ -80,40 +80,19 @@ else
     USE_WRAPPER=true
 fi
 
-PIP_BIN="$TARGET_VENV/bin/pip"
-
-# Check if pip exists
-if [ ! -f "$PIP_BIN" ]; then
-    echo "Error: pip not found at $PIP_BIN" >&2
-
-    if [ "$EUID" -ne 0 ] && [ "$TARGET_VENV" = "$USER_VENV" ]; then
-        echo "" >&2
-        echo "User venv not initialized. Run:" >&2
-        echo "  sysvenv init" >&2
-    fi
-
-    exit 1
-fi
-
-# ============================================================================
-# Snapshot handling for user venv
-# ============================================================================
-
-# Check if this is a write operation that should be snapshotted
-SNAPSHOT_OPERATIONS="install|uninstall|upgrade"
-FIRST_ARG="${1:-}"
-
-SHOULD_SNAPSHOT=false
-if [ "$USE_WRAPPER" = true ] && [[ "$FIRST_ARG" =~ ^($SNAPSHOT_OPERATIONS)$ ]]; then
-    SHOULD_SNAPSHOT=true
-fi
-
-# A single owner holds the operation lock through snapshots and pip execution.
-if [ "$SHOULD_SNAPSHOT" = true ]; then
+# Route all user calls before checking pip: another owner may be rebuilding it.
+# Global pip options must not bypass ownership. Project/system routing stays direct.
+if [ "$USE_WRAPPER" = true ]; then
     if command -v sysvenv >/dev/null 2>&1; then
         exec sysvenv _pip "$@"
     fi
+    echo "Error: sysvenv is required to coordinate user-venv pip operations" >&2
+    exit 1
 fi
 
-# Activated/project and system environments retain direct pip behavior.
+PIP_BIN="$TARGET_VENV/bin/pip"
+if [ ! -f "$PIP_BIN" ]; then
+    echo "Error: pip not found at $PIP_BIN" >&2
+    exit 1
+fi
 exec "$PIP_BIN" "$@"

@@ -53,3 +53,15 @@ This is not a security tool. This is not a production tool. This is a tool to ma
 ## License
 
 MIT
+## Concurrent operations
+
+User-environment commands share an advisory operation lock outside the venv.
+Initialization, repair, undo, clean, restore, import, and wrapper pip calls wait
+for the current owner before checking or modifying environment state. Snapshot
+and share commands use the same lock to capture a stable environment. Prompts
+retain ownership until accepted or cancelled; Ctrl-C cancels a waiting command.
+The wrapper requires `sysvenv` on PATH for user-environment calls, including pip
+options before the subcommand. Activated/project and system environments retain
+their direct routing. Direct calls to a venv's pip bypass this cooperative lock.
+This serialization does not add transactional restore or crash recovery; existing
+history, snapshots, and failure recovery behavior remain unchanged.

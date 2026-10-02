@@ -1463,41 +1463,41 @@ def snapshot_after(before_entry, exit_code):
 
 def cmd_pip(args):
     """Own before/pip/after as one serialized user-venv operation."""
-    if not args.command or args.command[0] not in {'install', 'uninstall', 'upgrade'}:
-        raise ValueError("_pip requires a pip mutation command")
     pip_bin = VENV_PATH / "bin" / "pip"
     if not pip_bin.is_file():
         raise FileNotFoundError(pip_bin)
-    ensure_dirs()
-    with open(LOCK_FILE, 'a') as lock_fd:
-        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
-        # Advisory checks must not prevent a requested pip operation.
-        if args.command[0] == 'install':
-            for check in (cmd_check_conflicts, cmd_check_downgrades):
-                try:
-                    check(args)
-                except Exception as exc:
-                    warning(f"Pre-install check unavailable: {exc}")
-        before_entry = snapshot_before(args)
-        exit_code = 1
+    # Serialize every user-wrapper invocation, including global pip options.
+    # Unrecognized/read-only invocations retain direct pip status behavior.
+    if not any(arg in {'install', 'uninstall', 'upgrade'} for arg in args.command):
+        result = subprocess.run([str(pip_bin), *args.command], check=False)
+        return 128 - result.returncode if result.returncode < 0 else result.returncode
+    # Advisory checks must not prevent a requested pip operation.
+    if args.command[0] == 'install':
+        for check in (cmd_check_conflicts, cmd_check_downgrades):
+            try:
+                check(args)
+            except Exception as exc:
+                warning(f"Pre-install check unavailable: {exc}")
+    before_entry = snapshot_before(args)
+    exit_code = 1
+    try:
+        result = subprocess.run([str(pip_bin), *args.command], check=False)
+        exit_code = result.returncode
+        if exit_code < 0:
+            exit_code = 128 - exit_code
+    except KeyboardInterrupt:
+        exit_code = 130
+    finally:
         try:
-            result = subprocess.run([str(pip_bin), *args.command], check=False)
-            exit_code = result.returncode
-            if exit_code < 0:
-                exit_code = 128 - exit_code
-        except KeyboardInterrupt:
-            exit_code = 130
-        finally:
-            try:
-                snapshot_after(before_entry, exit_code)
-            except Exception as exc:
-                warning(f"Could not finish operation #{before_entry['id']}: {exc}")
-        if args.command[0] == 'uninstall' and exit_code == 0:
-            try:
-                cmd_check_orphans(args, before_entry['id'])
-            except Exception as exc:
-                warning(f"Orphan check unavailable: {exc}")
-        return exit_code
+            snapshot_after(before_entry, exit_code)
+        except Exception as exc:
+            warning(f"Could not finish operation #{before_entry['id']}: {exc}")
+    if args.command[0] == 'uninstall' and exit_code == 0:
+        try:
+            cmd_check_orphans(args, before_entry['id'])
+        except Exception as exc:
+            warning(f"Orphan check unavailable: {exc}")
+    return exit_code
 
 
 def cmd_check_conflicts(args):
@@ -1759,9 +1759,14 @@ def main():
     parser_cd.set_defaults(func=cmd_check_downgrades)
 
     # Parse and run
-    args = parser.parse_args()
+    # The private wrapper boundary forwards pip flags verbatim, including flags
+    # before its subcommand; argparse must not interpret them as sysvenv flags.
+    if sys.argv[1:2] == ['_pip']:
+        args = argparse.Namespace(command=sys.argv[2:], func=cmd_pip)
+    else:
+        args = parser.parse_args()
 
-    if not args.command:
+    if not args.command and getattr(args, 'func', None) != cmd_pip:
         parser.print_help()
         return 1
 
@@ -1770,6 +1775,16 @@ def main():
         os.environ["SYSVENV_YES"] = "1"
 
     try:
+        # Acquire before state checks, prompts, snapshots, or child processes.
+        # Keep the lock outside the replaceable venv and never unlink it.
+        # doctor may call init directly: ownership belongs to this CLI invocation.
+        if args.func in {cmd_init, cmd_undo, cmd_clean, cmd_restore, cmd_import,
+                         cmd_snapshot, cmd_share, cmd_pip} or (
+                args.func == cmd_doctor and args.fix):
+            SYSVENV_ROOT.mkdir(parents=True, exist_ok=True)
+            with open(LOCK_FILE, 'a') as lock_fd:
+                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
+                return args.func(args)
         return args.func(args)
     except KeyboardInterrupt:
         print("\n\nInterrupted")
