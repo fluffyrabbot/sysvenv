@@ -1,6 +1,6 @@
 # sysvenv
 
-**Make `pip install` just work.** No sudo, no activation, no ceremony. No dignity left to lose.
+**Make `pip install` just work.** No sudo or environment activation.
 
 ## The Pitch
 
